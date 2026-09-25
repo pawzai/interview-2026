@@ -80,6 +80,14 @@ Say "we are on 21 with virtual threads for IO-bound fan-out" rather than recitin
 
 **Deadlock detection**: `jcmd <pid> Thread.print` - the JVM names the cycle. Prevent with lock ordering and `tryLock(timeout)`.
 
+**Structured concurrency**: `StructuredTaskScope` ties subtask lifetime to a block - fail-fast cancels siblings, nothing is orphaned. Final in JDK 25, preview from 21.
+
+**Context propagation**: `ThreadLocal` does not cross an executor boundary. Use a `TaskDecorator` (copy MDC + `SecurityContext`, **clear in `finally`**) or Micrometer `ContextSnapshot`. `ScopedValue` under virtual threads.
+
+**Lock contention**: invisible to a CPU profiler. JFR `jdk.JavaMonitorEnter` / `jdk.ThreadPark` / `jdk.VirtualThreadPinned`, or `async-profiler -e lock`. Never block inside `synchronized`.
+
+**False sharing**: two hot fields in one 64-byte cache line ping-pong between cores. `@Contended` pads; `perf c2c` detects. Prefer not sharing at all.
+
 ---
 
 ## JVM
@@ -97,6 +105,14 @@ Say "we are on 21 with virtual threads for IO-bound fan-out" rather than recitin
 **Tools**: `jcmd` (dumps, NMT) · `jstack` · JFR (always-on) · async-profiler (flame graphs) · Eclipse MAT (heap analysis) · JMH (benchmarks).
 
 **Reference types**: strong · soft (memory pressure) · weak (next GC, `WeakHashMap`) · phantom (`Cleaner`).
+
+**GC log decoder**: allocation rate = Eden emptied ÷ time between GCs. Promotion rate = old growth per GC. **Rising post-GC floor = leak; flat floor + rising frequency = allocation rate.** `to-space exhausted` = evacuation failure, full GC. `Humongous` = object > half a region, straight to old.
+
+**32GB cliff**: compressed oops die above ~32GB, references double to 8 bytes. Stay at `-Xmx31g` or jump past ~48GB. ZGC never compresses, so no cliff.
+
+**OOMKilled (137)** is `SIGKILL` on container RSS - `HeapDumpOnOutOfMemoryError` never fires. Watch `container_memory_working_set_bytes` minus heap: **the gap is the answer**. Dump path on a surviving volume, alert at 85 percent of the limit.
+
+**Classloader leak**: `jvm.classes.loaded` climbing while unloaded is flat. `jcmd VM.classloader_stats`, MAT duplicate classes. Held by `ThreadLocal`, `DriverManager`, MBeans, shutdown hooks.
 
 ---
 

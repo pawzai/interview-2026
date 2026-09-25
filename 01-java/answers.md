@@ -585,21 +585,120 @@ Options in the order I would consider them: confine it to one thread (`ThreadLoc
 
 The wrapper is usually the right first move because it is provable and reversible - and I would add a concurrency test with `jcstress` or a hammer test before declaring it safe.
 
+### Q84. Structured concurrency `[A]`
+
+`CompletableFuture.allOf` gives you composition but no *lifetime*. If one of five parallel calls fails, the other four keep running, consuming connections and downstream capacity for a result nobody will read; if the caller times out, the tasks are orphaned entirely; and the stack trace of a failure has no relationship to the code that launched it.
+
+`StructuredTaskScope` ties task lifetime to a lexical block. The scope is opened in a try-with-resources, subtasks are forked into it, `join()` waits, and *nothing escapes the block* - when it closes, every subtask is finished or cancelled.
+
+```java
+try (var scope = StructuredTaskScope.open(Joiner.<Response>allSuccessfulOrThrow())) {
+    var profile = scope.fork(() -> profileClient.fetch(id));
+    var orders  = scope.fork(() -> orderClient.fetch(id));
+    scope.join();
+    return merge(profile.get(), orders.get());
+}
+```
+
+The two ready-made policies cover most real use: fail-fast (the first failure cancels the siblings, which is what a fan-out read should do) and first-success (the first result cancels the rest, for hedged requests against replicas). Cancellation propagates by interrupt, so it only works if your tasks are interruptible - a blocking call on a socket with no timeout still hangs.
+
+It also restores the debugging property that concurrency usually destroys: the subtask's stack trace includes the forking frame, and thread dumps render the scope as a tree rather than as unrelated pool threads.
+
+The trade-off: it is scoped to a request, so it replaces fan-out inside a call, not long-lived background work. It finalized in JDK 25 (previews from 21, with an API change in 25 - `open(Joiner)` replaced the subclassing style), so on 21 it needs `--enable-preview`.
+
+> *Hook: a fan-out endpoint where a failing dependency used to leave four in-flight calls burning connection-pool slots.*
+
+### Q85. Virtual threads in production `[A]`
+
+Virtual threads remove the *thread* as the scarce resource. They do not remove scarcity - they relocate it, and usually to somewhere with worse failure behavior.
+
+Before: 200 Tomcat workers were an implicit, self-enforcing concurrency limit. A traffic spike queued at the connector, which is a survivable failure. After: 10,000 concurrent requests all reach the business logic at once, and the first shared resource they touch collapses.
+
+What to bound explicitly, in the order it bites:
+
+1. **The connection pool.** Hikari at 20 connections with 10,000 virtual threads means 9,980 threads blocked in `getConnection()`. Nothing breaks, but every request now pays queue time and the `connectionTimeout` becomes the effective SLA. Pool size is still bounded by the *database's* capacity, so raising it is rarely the fix.
+2. **Each downstream.** A `Semaphore` per dependency is now the bulkhead - the pool used to be one implicitly. Without it you convert your own scaling problem into an outage for the service you call.
+3. **Memory.** Each virtual thread's stack lives on the heap. Cheap individually, but 50,000 of them holding request buffers is real heap, and unlike an OOM from a leak this one appears only under load.
+
+What also changes: `synchronized` pins a carrier thread, so a blocking call inside a `synchronized` block can deadlock a pool of carriers - JDK 24 (JEP 491) removed most pinning, but on 21 you migrate hot paths to `ReentrantLock`. Thread pools become an anti-pattern (`newVirtualThreadPerTaskExecutor`, never a fixed pool). `ThreadLocal` still works but is no longer cheap in aggregate; `ScopedValue` is the replacement. And pooling-based metrics stop meaning anything - "active threads" is no longer a saturation signal, so you measure queue time at each bounded resource instead.
+
+What does not change: CPU-bound work gets no faster, and any blocking native or file-IO call still blocks a carrier.
+
+My migration order: turn it on for the request path only, keep every timeout, add the per-dependency semaphores *first*, and load-test for the new failure mode rather than for throughput.
+
+### Q86. Context propagation across executors
+
+Anything held in a `ThreadLocal` - MDC correlation ID, `SecurityContextHolder`, tenant, tracing span - is invisible to the thread that actually runs the task. The symptom is logs from async work with no trace ID and an `AuthenticationCredentialsNotFoundException` in a `@Async` method.
+
+The fix is to capture the context on the submitting thread and install it on the executing one, in a `finally`-guarded clear so a pooled thread never leaks it to the next task. Spring's `TaskDecorator` is the hook:
+
+```java
+public class ContextDecorator implements TaskDecorator {
+    @Override public Runnable decorate(Runnable task) {
+        var mdc = MDC.getCopyOfContextMap();
+        var auth = SecurityContextHolder.getContext().getAuthentication();
+        return () -> {
+            try {
+                if (mdc != null) MDC.setContextMap(mdc);
+                SecurityContextHolder.getContext().setAuthentication(auth);
+                task.run();
+            } finally {
+                MDC.clear();
+                SecurityContextHolder.clearContext();
+            }
+        };
+    }
+}
+```
+
+Ready-made equivalents: `DelegatingSecurityContextExecutor` for security only, Micrometer's `ContextSnapshot`/`ContextExecutorService` for the general case (it also carries the observation and trace context), and for WebFlux the Reactor `Context` instead, since there is no thread affinity at all.
+
+Two traps. First, propagating a `SecurityContext` into a long-lived background task means it outlives the request, so the authorization decision is made against a stale principal - for genuinely detached work, re-authenticate rather than inherit. Second, the `finally` clear is not optional: without it, a pooled thread carries one user's identity into the next user's task, which is an authorization bug, not a logging bug.
+
+With virtual threads, `ThreadLocal` still propagates nothing across the boundary, but `ScopedValue` changes the shape: the value is bound for the dynamic extent of a call and is automatically visible to structured-concurrency subtasks, immutable, and reclaimed at the end of the block - so there is nothing to clear and nothing to leak.
+
+### Q87. False sharing and `@Contended`
+
+The unit of coherence between cores is the cache line, typically 64 bytes, not the variable. Two independent counters that land in the same line cause every write on one core to invalidate the other core's copy, so threads that share no data still ping-pong the line between caches. Throughput drops by an order of magnitude and the code looks perfectly correct.
+
+Classic shapes: adjacent fields in a hot object written by different threads; adjacent slots in an array of counters, one per shard; a ring buffer's producer and consumer indices in the same line.
+
+`@jdk.internal.vm.annotation.Contended` pads a field so it occupies its own line, and requires `-XX:-RestrictContended` to use outside the JDK. That is deliberate friction: padding costs memory and cache footprint, and applied casually it makes things slower.
+
+When it is right: a small, fixed number of very hot, independently-written fields, with a measurement showing the improvement. When it is not: almost everywhere else - the better answers are usually to stop sharing (per-thread accumulation merged at the end, which is exactly what `LongAdder` does with its padded cells) or to make the field read-mostly.
+
+Detect it rather than guess: `perf c2c` on Linux identifies contended lines directly, and the softer signal is a hot method with a high cache-miss rate and no obvious lock.
+
+### Q88. Finding lock contention in production
+
+Contention is invisible in a profiler that only samples CPU - a blocked thread burns no CPU, so the flame graph looks healthy while latency is terrible. You need wall-clock or lock-specific evidence.
+
+My order:
+
+1. **Thread dumps first**, because they cost nothing: `jcmd <pid> Thread.print`, three of them ten seconds apart. Many threads `BLOCKED` on the same `<0x...>` monitor with one owner is contention; the same stack in all three dumps is a stuck thread, not a busy one.
+2. **JFR for the quantified view.** `jcmd <pid> JFR.start settings=profile` then look at the `jdk.JavaMonitorEnter` and `jdk.ThreadPark` events - they carry the monitor class, the blocking duration and the stack, so you get *which lock, for how long, from where* rather than an impression. `jdk.VirtualThreadPinned` is the equivalent for carrier pinning. The default 20ms threshold hides high-frequency short waits, so lower it when the picture looks too clean.
+3. **async-profiler in lock mode**: `-e lock` produces a flame graph weighted by time spent blocking rather than by CPU, which is the fastest way to see the offending call path. `-e wall` when you are not yet sure it is a lock at all.
+4. **`ReentrantLock` instrumentation** when it is your own lock: `getQueueLength()` exported as a metric turns the next occurrence into a dashboard instead of an investigation.
+
+Fixes, in the order that usually pays: shrink the critical section (do IO and serialization outside it), replace coarse locking with a striped or per-key lock, switch read-dominated state to `ReadWriteLock`, `StampedLock` optimistic reads or a copy-on-write structure, or remove the shared state entirely with per-thread accumulation.
+
+> *Hook: a synchronized cache-refresh method that serialized every request until the load was moved outside the lock.*
+
 ---
 
 ## 5. JVM internals, memory and performance
 
-### Q84. Memory areas
+### Q89. Memory areas
 
 Heap (shared, GC-managed, holds objects, split into young and old). Metaspace (native memory, class metadata; replaced PermGen in Java 8 and grows until `MaxMetaspaceSize`). Per-thread stacks (frames, locals, ~1MB default - `StackOverflowError` lives here). Code cache (JIT-compiled native code; if it fills, the JVM reverts to interpretation and performance quietly halves). Direct/native memory for NIO buffers, outside the heap and invisible to `-Xmx`.
 
-### Q85. Generational collection
+### Q90. Generational collection
 
 Objects are allocated in Eden. A minor GC copies survivors to a survivor space; each surviving collection increments the object's age; at the tenuring threshold it is promoted to the old generation. Objects too large for Eden are allocated directly in old (humongous allocations in G1). The weak generational hypothesis - most objects die young - is why this is fast: collection cost is proportional to *live* data, not garbage.
 
 Premature promotion (survivor space too small) is a common cause of frequent full GCs.
 
-### Q86. Choosing a collector
+### Q91. Choosing a collector
 
 - **Serial**: single-threaded, tiny heaps, containers with one core.
 - **Parallel**: throughput-optimized, long pauses acceptable - batch jobs.
@@ -609,13 +708,13 @@ Premature promotion (survivor space too small) is a common cause of frequent ful
 
 My decision rule: start with G1; move to ZGC when p99 latency is dominated by GC pauses and the heap is large; use Parallel when throughput matters more than tail latency.
 
-### Q87. Stop-the-world in G1
+### Q92. Stop-the-world in G1
 
 Long pauses usually come from: humongous allocations (objects over half a region) fragmenting old space; a mixed-collection set that is too large; reference processing (many weak/soft references or finalizers); or an evacuation failure ("to-space exhausted") where G1 cannot find space for survivors and degrades to a full GC.
 
 Fixes: increase heap or region size, reduce allocation rate, raise `InitiatingHeapOccupancyPercent` headroom, and eliminate the allocation hot spot found in the allocation profile.
 
-### Q88. Container OOM-kill with healthy heap `[T]`
+### Q93. Container OOM-kill with healthy heap `[T]`
 
 The container limit covers *all* JVM memory, and heap is only part of it. The rest: metaspace, code cache, thread stacks (1MB × thread count - 500 threads is 500MB), direct byte buffers used by Netty and NIO, GC structures, JIT and compiler arenas, and native allocations from libraries such as compression or crypto.
 
@@ -623,7 +722,7 @@ Diagnosis: enable Native Memory Tracking (`-XX:NativeMemoryTracking=summary` the
 
 > *Hook: a Kubernetes service being killed every few hours until direct buffers were capped.*
 
-### Q89. `OutOfMemoryError` variants
+### Q94. `OutOfMemoryError` variants
 
 - **Java heap space**: genuine leak or under-sized heap. Take a heap dump.
 - **GC overhead limit exceeded**: over 98 percent of time in GC recovering under 2 percent of heap - a leak in its late stage.
@@ -632,7 +731,7 @@ Diagnosis: enable Native Memory Tracking (`-XX:NativeMemoryTracking=summary` the
 - **Unable to create new native thread**: thread leak or an OS/cgroup thread limit, not a heap problem at all.
 - **Requested array size exceeds VM limit**: an array over ~2^31 elements, usually an unbounded query result.
 
-### Q90. Finding a leak in production
+### Q95. Finding a leak in production
 
 1. Confirm from metrics: old-gen occupancy after full GC trending upward over days.
 2. Capture a heap dump at low traffic (`jcmd <pid> GC.heap_dump`) - accept the pause, or take it from a canary instance.
@@ -642,11 +741,11 @@ Diagnosis: enable Native Memory Tracking (`-XX:NativeMemoryTracking=summary` the
 
 For continuous visibility I keep Java Flight Recorder running with a low-overhead profile and use async-profiler for allocation flame graphs.
 
-### Q91. Reference types
+### Q96. Reference types
 
 Strong: normal; never collected while reachable. Soft: collected only under memory pressure - suitable for a memory-sensitive cache, though in practice a bounded Caffeine cache is more predictable. Weak: collected at the next GC once weakly reachable - used for canonicalizing maps and `WeakHashMap` keys, and by `ThreadLocal` for its keys. Phantom: never returns the referent, enqueued after finalization - used with `Cleaner` for deterministic native-resource cleanup, e.g. freeing direct buffers.
 
-### Q92. JIT
+### Q97. JIT
 
 The JVM interprets first, profiles hot paths, then compiles. Tiered compilation goes through C1 (fast compilation, light optimization, gathers profile data) into C2 (aggressive optimization) for the hottest methods.
 
@@ -654,19 +753,19 @@ Optimizations that matter: inlining (the enabler for everything else - and why v
 
 Deoptimization happens when a speculation is invalidated - a new subclass is loaded, or an "impossible" branch is taken - and the method falls back to the interpreter and is recompiled. This is why performance can change after hours of uptime, and why the first minutes after deployment are slow.
 
-### Q93. Naive microbenchmarks `[T]`
+### Q98. Naive microbenchmarks `[T]`
 
 They measure the wrong thing: no JIT warm-up so you time the interpreter, dead code elimination removes the computation whose result you ignore, constant folding precomputes it, GC and other JVM activity add noise, and `currentTimeMillis` has coarse resolution.
 
 Use JMH: it handles warm-up iterations, forks a fresh JVM per run, provides `Blackhole` to consume results, and reports distributions rather than a single number. And treat any microbenchmark as suggestive only - the real judge is a production-shaped load test.
 
-### Q94. Escape analysis
+### Q99. Escape analysis
 
 The JIT proves an object never escapes the method (never stored to a field, never returned, never passed to an unanalyzable call). It can then apply scalar replacement - split the object into its fields held in registers, so no allocation at all - and lock elision, removing synchronization on a thread-confined object.
 
 This is why "avoid allocation" advice is often wrong for short-lived local objects, and why a small wrapper or `Optional` in a hot loop frequently costs nothing after warm-up.
 
-### Q95. Reading a thread dump
+### Q100. Reading a thread dump
 
 Take three dumps, ten seconds apart, so you can distinguish a stuck thread from a busy one.
 
@@ -674,13 +773,13 @@ Look for, in order: the JVM's own deadlock report at the bottom; threads in `BLO
 
 Correlate with CPU: `top -H -p <pid>`, convert the offending thread ID to hex, and find it in the dump by `nid=`.
 
-### Q96. Production JVM flags
+### Q101. Production JVM flags
 
 `-XX:MaxRAMPercentage=70` (container-aware sizing instead of a fixed `-Xmx`), `-XX:+UseG1GC` or `-XX:+UseZGC -XX:+ZGenerational`, `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps`, `-XX:+ExitOnOutOfMemoryError` for containers so the orchestrator restarts a poisoned process, GC logging with rotation (`-Xlog:gc*:file=...:time,uptime:filecount=5,filesize=20M`), `-XX:NativeMemoryTracking=summary`, JFR enabled with a low-overhead profile, and `-XX:+UseStringDeduplication` when string-heavy.
 
 Equally important: setting `-Xms` equal to `-Xmx` in containers to avoid heap resizing pauses.
 
-### Q97. p50 20ms, p99 3s `[A]`
+### Q102. p50 20ms, p99 3s `[A]`
 
 The gap means something intermittent, not something slow. My checklist:
 
@@ -693,11 +792,116 @@ The gap means something intermittent, not something slow. My checklist:
 
 I would attach distributed tracing filtered to slow traces, and compare the span breakdown of a p99 trace against a p50 trace. That usually answers it in one look.
 
+### Q103. Reading a GC log
+
+With `-Xlog:gc*:file=gc.log:time,uptime,level,tags` a G1 young collection prints roughly:
+
+```text
+[2026-08-14T10:22:31.104+0000][412.882s] GC(918) Pause Young (Normal) (G1 Evacuation Pause)
+[2026-08-14T10:22:31.104+0000][412.882s] GC(918)   Eden regions: 512->0(498)
+[2026-08-14T10:22:31.104+0000][412.882s] GC(918)   Survivor regions: 14->28(66)
+[2026-08-14T10:22:31.104+0000][412.882s] GC(918)   Old regions: 1204->1211
+[2026-08-14T10:22:31.104+0000][412.882s] GC(918)   Humongous regions: 6->6
+[2026-08-14T10:22:31.104+0000][412.882s] GC(918) 10944M->9772M(16384M) 38.412ms
+```
+
+The four numbers I actually derive, none of which are printed directly:
+
+- **Allocation rate**: Eden emptied (512 regions × region size) divided by the gap to the previous GC. This is the single best predictor of GC cost, because collection frequency is allocation rate divided by Eden size.
+- **Promotion rate**: the growth in old regions per collection. High promotion means objects are surviving that should have died - usually an under-sized survivor space causing premature promotion, or genuinely long-lived request state.
+- **The post-GC floor**: old occupancy immediately *after* a full or concurrent cycle. A rising floor across days is a leak. A flat floor with rising frequency is an allocation-rate problem, and the fix is completely different.
+- **Pause distribution**, not the mean. `Pause Young (Normal)` at tens of milliseconds is healthy; the tail is what shows in p99.
+
+Lines that are diagnoses in themselves:
+
+- **`to-space exhausted`** - G1 had nowhere to evacuate survivors and degraded to a full GC, typically a multi-second pause. Cause is a sudden allocation spike or too little headroom; fix by lowering `InitiatingHeapOccupancyPercent` so concurrent marking starts earlier, raising `G1ReservePercent`, or adding heap.
+- **`Humongous`** regions growing - allocations larger than half a region, which bypass Eden and go straight to old, fragmenting it. Usually a large byte array or a big collection resized in one go. Raise `G1HeapRegionSize` or, better, stop allocating the object.
+- **`Pause Full (G1 Compaction Pause)`** - in G1 this is a failure mode, not routine. Every one of them deserves an explanation.
+- **`Pause Young (Concurrent Start)`** followed much later by `Pause Remark` - a marking cycle; if these run back to back the JVM is barely keeping up.
+
+For anything beyond a glance I load the log into GCeasy or GCViewer rather than reading it by eye, because the useful views are the derived rates over time, not individual lines.
+
+### Q104. The 32GB compressed oops cliff `[T]`
+
+On 64-bit JVMs, references are stored as 32-bit offsets scaled by the 8-byte object alignment, giving a 32GB addressable range - "compressed ordinary object pointers". Every reference field, and every array-of-object slot, costs 4 bytes instead of 8, and object headers are smaller.
+
+Cross 32GB and the JVM silently disables the optimization. References double in width, so a reference-dense heap loses roughly 20 percent of its capacity to pointer overhead, plus cache lines now hold half as many references, which costs throughput too. A 32GB heap therefore holds *less* live data than a 31GB one - the extra gigabyte buys nothing and the encoding change takes several away.
+
+The rule: stay at or below about 31GB (`-Xmx31g`), or jump well past 40-48GB where the raw capacity finally exceeds what compressed oops gave you. Verify with `java -Xmx32g -XX:+PrintFlagsFinal -version | grep UseCompressedOops` rather than trusting the threshold, because the exact cliff depends on `ObjectAlignmentInBytes` and where the heap base lands.
+
+Two footnotes worth having: raising `ObjectAlignmentInBytes` to 16 extends the range to 64GB but wastes alignment padding on every object, so it rarely pays; and this only applies to collectors that use compressed oops at all - ZGC uses colored pointers and never compresses, so the cliff does not exist there.
+
+In practice the better answer at that size is usually several smaller JVMs rather than one large one, which also caps GC pause cost.
+
+### Q105. Direct buffer leaks
+
+A `ByteBuffer.allocateDirect` allocation lives outside the heap; the on-heap `DirectByteBuffer` object is only a handle, and the native memory is released when *that handle* is collected and its `Cleaner` runs. So the failure mode is: the heap is nowhere near full, nothing triggers a GC, the handles stay alive, and native memory grows until the container is killed or you get `OutOfMemoryError: Direct buffer memory`.
+
+Three distinct causes, with different fixes:
+
+1. **No GC pressure.** Handles are cheap, so nothing forces the collection that would free the native memory. Setting `-XX:MaxDirectMemorySize` explicitly is what makes this survivable - it caps the pool and forces a `System.gc()` attempt plus a clean `OutOfMemoryError` instead of an OOM-kill.
+2. **Genuine retention.** Buffers held in a cache, a queue that never drains, or a connection object that is never closed. This is an ordinary heap-reachability problem and MAT finds it by retained size on `DirectByteBuffer`.
+3. **Netty reference counting.** Netty's pooled `ByteBuf` is not GC-managed at all - it is refcounted, and a handler that returns early without `release()`, or that fails to call `ReferenceCountUtil.release` on a message it does not pass along, leaks pooled arenas.
+
+For the Netty case the tooling is specific: run with `-Dio.netty.leakDetection.level=paranoid` in a load test (it samples every buffer and prints the stack of the *last access* to a leaked one, which names the handler directly), watch `PooledByteBufAllocator.metric()` arena counters, and remember `SimpleChannelInboundHandler` releases for you while a raw `ChannelInboundHandlerAdapter` does not - that asymmetry is the most common source.
+
+Confirming it is direct memory at all: `-XX:NativeMemoryTracking=detail` plus `jcmd <pid> VM.native_memory summary.diff` shows the Internal/Other category growing while heap is flat; `BufferPoolMXBean` (exposed by Micrometer as `jvm.buffer.memory.used`) gives the same number as a metric, which is what I would alert on.
+
+### Q106. Proving a classloader leak
+
+`OutOfMemoryError: Metaspace` has two very different causes, and raising `MaxMetaspaceSize` fixes one and delays the other by a day.
+
+The distinguishing question is whether the *class count* is stable. An application that legitimately loads 40,000 classes needs more metaspace once. An application that leaks loads the same classes repeatedly under new classloaders that can never be unloaded, so the count climbs forever.
+
+How I prove it:
+
+1. `jcmd <pid> VM.metaspace summary` for the total, then take the class count from `jcmd <pid> GC.class_stats` or the `jvm.classes.loaded` metric over hours. Loaded climbing while unloaded stays flat is the signature.
+2. `jcmd <pid> VM.classloader_stats` (or `VM.classloaders`) lists every loader with its class count. Many instances of the *same* loader class is the leak, visible in one command.
+3. Heap dump into MAT, then the "Duplicate Classes" view, and for the retention path: find the `ClassLoader` instances, take the shortest path to a GC root. A classloader is kept alive by any single reference to any class it loaded, which is why the usual culprits are so indirect - a `ThreadLocal` on a pooled thread whose value's class came from the old loader, a JDBC driver registered in `DriverManager`, a shutdown hook, a `java.util.logging` logger, a static cache keyed by `Class`, or an MBean never deregistered.
+
+The common generators: repeated hot redeploy in an application server, dynamic proxy or CGLIB generation per request or per tenant rather than per type, scripting engines and expression compilers, and repeatedly building a Spring context in tests without closing it.
+
+Fixes are cause-specific - cache the generated proxy, deregister on shutdown, `remove()` the `ThreadLocal` - but the standing guard is an alert on `jvm.classes.loaded` trending up over a 24-hour window, which catches the next one before it pages anyone.
+
+### Q107. Getting a dump out of an OOMKilled container `[A]`
+
+The hard constraint: an OOM-kill is `SIGKILL` from the kernel. The JVM gets no chance to run anything, so `-XX:+HeapDumpOnOutOfMemoryError` produces nothing - that flag only fires on a *Java* `OutOfMemoryError`, which is a different event. Anyone who says "we have HeapDumpOnOutOfMemoryError set" has not distinguished the two.
+
+So the work is done in advance:
+
+1. **Write dumps to a volume that outlives the container.** `-XX:HeapDumpPath=/dumps` on an `emptyDir` is still lost when the pod is deleted; a PVC, or a sidecar that uploads to S3 when a file appears, is what actually survives. Filenames must include the pod name and timestamp, or a crash loop overwrites the useful one.
+2. **Add `-XX:+ExitOnOutOfMemoryError`** so a Java OOM kills the process immediately rather than limping along - a JVM thrashing in GC after an OOM produces misleading dumps and stays "ready" to the load balancer.
+3. **Give the JVM room to lose.** Set `-XX:MaxRAMPercentage` around 70 so a heap OOM (recoverable, dumpable) happens before the container limit (not recoverable). This is the single change that converts most OOM-kills into diagnosable events.
+
+To get evidence from the kill that already happened:
+
+- `kubectl describe pod` for `Last State: Terminated, Reason: OOMKilled, Exit Code: 137` and, on the node, `dmesg` for the kernel's OOM report with the actual RSS at kill time.
+- `kubectl logs --previous` for the dead container's output.
+- `container_memory_working_set_bytes` against the limit in the minutes before the kill, plotted alongside JVM heap used - the gap between them *is* the answer, and it points at native memory rather than the heap.
+
+To get a dump before the *next* one: `jcmd <pid> GC.heap_dump /dumps/heap.hprof` from an ephemeral debug container (`kubectl debug -it <pod> --target=<container>`, which shares the process namespace), or scripted from a sidecar when working-set memory crosses a threshold. If the pod is still alive but wedged, `kubectl cp` the file out before anything restarts it - and be aware a dump of a 12GB heap is a 12GB file, so it needs the disk space and it will pause the JVM while it is written.
+
+Standing prevention: NMT enabled, JFR always-on with a rolling buffer written to the same volume, and a memory-based alert that fires at 85 percent of the limit so a human or an automation captures the dump *before* the kernel makes it impossible.
+
+> *Hook: the service that crash-looped nightly until the gap between working-set and heap made it obvious the memory was in direct buffers.*
+
+### Q108. Allocation rate versus a leak `[T]`
+
+Not a leak. The defining test is the post-GC floor: if old-generation occupancy immediately after a full or concurrent cycle returns to the same level every time, all that memory is being reclaimed and nothing is retained. A leak has a *rising* floor.
+
+What this pattern actually shows is a high allocation rate: the application produces garbage faster than it produces work, so GC runs constantly, and the cost appears as CPU spent in GC threads and as p99 latency, not as memory growth.
+
+Why the distinction matters for the fix: adding heap genuinely helps here - a bigger Eden means fewer, larger collections and less total overhead - whereas adding heap to a real leak just moves the OOM to next week and makes the eventual full GC longer. Getting this backwards is the most common wasted quarter in performance work.
+
+Finding the source: an allocation flame graph, `async-profiler -e alloc` or the JFR `jdk.ObjectAllocationSample` event, which attributes bytes to a stack. The usual answers are unsurprising once you see them - logging that builds strings at a level that is disabled, a DTO mapped three times on the way through, a query returning 50,000 rows to filter five in Java, boxing in a hot loop, `String.format` on a per-request path, or an oversized JSON payload deserialized in full.
+
+The cheap knobs before touching code: raise the heap so Eden grows, and check survivor sizing, because premature promotion turns a young-generation problem into an old-generation one. But the real fix is nearly always allocating less, and the flame graph usually shows one call path responsible for most of it.
+
 ---
 
 ## 6. Design patterns and clean code
 
-### Q98. SOLID in practice
+### Q109. SOLID in practice
 
 - **SRP**: an `OrderService` that also formats emails and writes CSV changes for three unrelated reasons. Split by *reason to change*, not by "one method per class".
 - **OCP**: a `switch` over payment types recompiled for every new type; replace with a `PaymentHandler` interface and let Spring inject `List<PaymentHandler>`, selecting by `supports(type)`.
@@ -705,63 +909,63 @@ I would attach distributed tracing filtered to slow traces, and compare the span
 - **ISP**: a fat `UserService` interface forcing test doubles to stub ten unused methods; split into role interfaces.
 - **DIP**: the service layer importing `JdbcTemplate` directly; depend on a repository interface owned by the domain, implemented in the infrastructure layer.
 
-### Q99. Strategy versus Template Method versus State
+### Q110. Strategy versus Template Method versus State
 
 Strategy: interchangeable algorithms selected by the client, composed at runtime. Template Method: fixed algorithm skeleton in a base class with subclass hooks - inheritance-based, so more rigid. State: the object's behavior changes because *its own* state changed, and states know about transitions.
 
 I prefer Strategy by default because composition beats inheritance for testing; Template Method is fine when the skeleton is genuinely invariant (Spring's `JdbcTemplate` is the canonical example).
 
-### Q100. Builder
+### Q111. Builder
 
 Beyond the telescoping-constructor problem, the real value is: enforcing invariants in `build()` so no invalid object ever exists, supporting optional parameters without a combinatorial constructor explosion, producing immutable objects, and giving readable call sites where boolean or same-typed parameters would otherwise be positionally ambiguous. With records, a compact constructor plus a generated builder (Lombok `@Builder`) covers most cases.
 
-### Q101. Factory versus DI
+### Q112. Factory versus DI
 
 A DI container is a factory, so constructor-arg factories have largely been absorbed. Factories still earn their place when the choice is *data-driven at runtime* (create a handler based on a message type), when construction is genuinely complex, or when you must decouple from a third-party API. In Spring the idiomatic form is injecting a `Map<String, Handler>` (bean name to bean) or a `List<Handler>` with a `supports()` predicate.
 
-### Q102. Decorator versus Proxy
+### Q113. Decorator versus Proxy
 
 Structurally identical - both implement the same interface and wrap an instance. The difference is intent and lifecycle: a Decorator *adds behavior* and is stacked by the client, who chooses the composition; a Proxy *controls access* to a subject it usually creates or manages, adding lazy loading, remoting, caching or security without the client knowing.
 
 Spring AOP is proxy-based; a `BufferedInputStream` wrapping a `FileInputStream` is a decorator.
 
-### Q103. Observer versus event bus versus broker
+### Q114. Observer versus event bus versus broker
 
 In-process `Observer` / Spring `ApplicationEvent`: synchronous by default, same transaction and same JVM, no durability - good for decoupling within a module. An in-process event bus adds async dispatch but still dies with the process. A message broker (Kafka, SQS) adds durability, cross-process delivery, replay and backpressure, at the cost of eventual consistency and operational complexity.
 
 The boundary rule: if losing the event on a crash is unacceptable, it must cross a broker with an outbox, not an in-memory listener.
 
-### Q104. Singleton as anti-pattern `[T]`
+### Q115. Singleton as anti-pattern `[T]`
 
 The classic static-holder Singleton hides its dependency (callers reach for it globally rather than declaring it), makes testing hard because you cannot substitute it, introduces global mutable state, and can leak across classloaders.
 
 Spring's singleton scope is a different thing: one instance per container, but injected explicitly, so it stays substitutable and testable. The pattern is fine; the `static getInstance()` implementation is what causes the pain.
 
-### Q105. Resilience patterns
+### Q116. Resilience patterns
 
 **Retry** handles transient faults - must be paired with exponential backoff plus jitter, a bounded attempt count, and idempotency, or it becomes a self-inflicted denial of service. **Circuit breaker** stops calling a failing dependency (closed → open after a failure threshold → half-open trial), converting slow failures into fast ones. **Bulkhead** isolates resources per dependency, so one slow downstream cannot consume the whole thread or connection pool.
 
 Composition order in Resilience4j matters: `Retry(CircuitBreaker(RateLimiter(TimeLimiter(Bulkhead(call)))))` - retry outermost so it observes the breaker, timeout inside so each attempt is bounded. And always define a fallback: cached data, degraded response, or a queued write.
 
-### Q106. Inheritance versus composition `[A]`
+### Q117. Inheritance versus composition `[A]`
 
 I ask: is this a true "is-a" that satisfies Liskov for every current *and future* caller, or am I reusing code? If it is reuse, compose. Inheritance couples you to the parent's implementation details, breaks encapsulation (the fragile base class problem), and consumes your one superclass slot.
 
 I permit inheritance for stable, shallow hierarchies designed for extension and documented as such, and for sealed hierarchies modelling a closed set of variants.
 
-### Q107. Clean code at team scale `[A]`
+### Q118. Clean code at team scale `[A]`
 
 Definition: code a competent engineer unfamiliar with it can change safely in an afternoon. That means clear naming, small units with one reason to change, explicit boundaries, and tests that document intent.
 
 Enforcement without being a bottleneck: automate everything mechanical (Spotless/Checkstyle, SonarQube quality gate on new code only, mutation testing on core modules, architecture tests with ArchUnit so layering violations fail the build), write a short set of team conventions with the *rationale*, and reserve human review for design and risk. I also rotate who runs design review so the standard is not attached to me personally.
 
-### Q108. Hexagonal architecture
+### Q119. Hexagonal architecture
 
 The domain sits in the centre and defines *ports* (interfaces) for what it needs; adapters implement them for HTTP, JPA, Kafka, S3. Dependencies point inward only.
 
 Testing payoff: domain logic is testable with plain JUnit and in-memory adapters, no Spring context, so the fast test tier covers the important logic in milliseconds; integration tests (Testcontainers) then verify only the adapters. The cost is more interfaces and indirection, so I apply it to the core domain modules, not to a CRUD service.
 
-### Q109. DDD and service boundaries
+### Q120. DDD and service boundaries
 
 An **aggregate** is a consistency boundary - one transaction, one aggregate, referenced from outside only by identity. A **bounded context** is a linguistic and model boundary; the same word means different things in two contexts ("customer" in billing versus in support), and forcing one shared model is the root of most distributed monoliths.
 
@@ -771,61 +975,61 @@ Mapping to microservices: a service should own one or a few bounded contexts and
 
 ## 7. Spring Framework and Spring Boot
 
-### Q110. Dependency injection
+### Q121. Dependency injection
 
 DI inverts control of dependency construction so a class declares what it needs and the container supplies it, enabling substitution in tests and decoupling from concrete implementations.
 
 Constructor injection is my default: dependencies are explicit, the object is fully initialized and can be `final`, it works without Spring in a unit test, and an over-long constructor is a visible SRP warning. Setter injection only for genuinely optional dependencies. Field injection I do not allow.
 
-### Q111. Why field injection is discouraged `[T]`
+### Q122. Why field injection is discouraged `[T]`
 
 The field cannot be `final`, so the object is mutable and not thread-safe by construction; you cannot instantiate the class in a plain unit test without reflection; the dependency list is hidden, so a class with twelve dependencies looks fine; and circular dependencies get silently resolved instead of failing fast.
 
 Since Spring 4.3, a single-constructor class does not even need `@Autowired`, so constructor injection is no more verbose.
 
-### Q112. Bean lifecycle
+### Q123. Bean lifecycle
 
 Instantiate → populate dependencies → `BeanNameAware`/`BeanFactoryAware`/`ApplicationContextAware` → `BeanPostProcessor.postProcessBeforeInitialization` → `@PostConstruct` → `InitializingBean.afterPropertiesSet` → custom `init-method` → `BeanPostProcessor.postProcessAfterInitialization` (this is where AOP proxies are created) → bean in use → `@PreDestroy` → `DisposableBean.destroy` → custom destroy method.
 
 The key insight for interviews: proxies are created in the *after-initialization* post-processor, which is why `@PostConstruct` code runs on the raw target and self-invocation there is never proxied.
 
-### Q113. Bean scopes
+### Q124. Bean scopes
 
 `singleton` (one per container, default), `prototype` (new instance per lookup; Spring does *not* manage its destruction, so `@PreDestroy` never runs), plus web scopes `request`, `session`, `application`, `websocket`.
 
 Singletons must be stateless, or thread-safe, because one instance serves all concurrent requests. The most common production bug I see is an instance field on a `@Service` used as per-request state.
 
-### Q114. Singleton depending on prototype `[T]`
+### Q125. Singleton depending on prototype `[T]`
 
 The dependency is injected once, at singleton creation, so the same prototype instance is reused forever - the prototype scope is effectively lost.
 
 Two fixes: inject an `ObjectProvider<T>` (or `Provider<T>`) and call `getObject()` per use - my preference, since it is explicit and testable; or use `@Lookup` method injection / `@Scope(proxyMode = TARGET_CLASS)`, which puts a proxy in place that resolves a new instance per call.
 
-### Q115. Auto-configuration
+### Q126. Auto-configuration
 
 `@SpringBootApplication` includes `@EnableAutoConfiguration`, which imports `AutoConfigurationImportSelector`. That reads candidate configuration class names from `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` (the `spring.factories` mechanism before Boot 2.7) on every jar in the classpath, filters them by `@Conditional` annotations, orders them with `@AutoConfigureBefore`/`After`, and registers the survivors.
 
 The conditions are why it feels magical: `@ConditionalOnClass(DataSource.class)` plus `@ConditionalOnMissingBean(DataSource.class)` means "configure a DataSource only if the driver is present and the user has not defined one". Run with `--debug` to get the auto-configuration report showing matched and unmatched conditions - that is the answer to "why is this bean not being created".
 
-### Q116. `@Conditional` and overriding
+### Q127. `@Conditional` and overriding
 
 `@ConditionalOnMissingBean` is the back-off hook: define your own bean of that type and the auto-configured one steps aside. Ordering matters, so user configuration must be processed first - which it is, because auto-configuration is always registered last.
 
 Others I use: `@ConditionalOnProperty` (feature flags at wiring level), `@ConditionalOnClass`/`OnMissingClass`, `@ConditionalOnWebApplication`, `@Profile`, and custom `Condition` implementations. To disable one outright: `@SpringBootApplication(exclude = DataSourceAutoConfiguration.class)` or `spring.autoconfigure.exclude`.
 
-### Q117. Stereotype annotations
+### Q128. Stereotype annotations
 
 All are `@Component` meta-annotated, so scanning treats them identically. The functional differences are: `@Repository` adds exception translation (`PersistenceExceptionTranslationPostProcessor` converts vendor `SQLException`s into Spring's `DataAccessException` hierarchy), and `@Controller`/`@RestController` are detected by Spring MVC's handler mapping; `@RestController` also implies `@ResponseBody`.
 
 `@Service` carries no behavior at all - it is documentation of intent, and useful for AOP pointcuts by annotation.
 
-### Q118. Spring AOP proxies
+### Q129. Spring AOP proxies
 
 Spring AOP is proxy-based and method-level only (not field access, not constructors). If the bean implements at least one interface, Spring uses JDK dynamic proxies by default; otherwise it uses CGLIB subclassing. Boot sets `spring.aop.proxy-target-class=true` by default, so CGLIB is generally used.
 
 Consequences worth naming: CGLIB cannot proxy `final` classes or `final` methods, and it needs a usable constructor; JDK proxies only expose interface methods, so injecting by concrete class fails. For call-level interception (private methods, self-calls, constructors) you need AspectJ weaving instead.
 
-### Q119. `@Transactional` self-invocation `[T]`
+### Q130. `@Transactional` self-invocation `[T]`
 
 The annotation is implemented by a proxy that starts a transaction before delegating to the target. A self-call (`this.doWork()`) goes straight to the target instance and never touches the proxy, so no transaction. Same for `private`, `final` and `static` methods - the proxy cannot intercept them. And `@Transactional` on a method called from `@PostConstruct` runs before the proxy exists.
 
@@ -833,43 +1037,43 @@ Two fixes: move the transactional method into a separate bean and inject it (my 
 
 > *Hook: partial writes in a batch retry path caused exactly by this.*
 
-### Q120. Propagation
+### Q131. Propagation
 
 `REQUIRED` (default) joins an existing transaction or starts one. `REQUIRES_NEW` suspends the current one and runs independently - the right choice for audit logging or a failure record that must survive the caller's rollback. `NESTED` uses a JDBC savepoint, so an inner rollback does not kill the outer transaction (JDBC only, not JTA). `SUPPORTS` joins if present, otherwise runs non-transactionally. `MANDATORY` throws if there is no transaction - a good guard on internal helpers. `NEVER` and `NOT_SUPPORTED` are the inverses.
 
 The trap with `REQUIRES_NEW`: it holds two connections simultaneously, so under load it can exhaust the pool and even self-deadlock if the inner transaction waits on a row the outer one locked.
 
-### Q121. Rollback rules `[T]`
+### Q132. Rollback rules `[T]`
 
 By default Spring rolls back only on unchecked exceptions (`RuntimeException`) and `Error`. A **checked exception commits the transaction**, which surprises everyone - a `throw new IOException()` from your service leaves the partial write committed.
 
 Fix with `@Transactional(rollbackFor = Exception.class)`, or standardize on unchecked domain exceptions. Second trap: catching an exception inside the transactional method means Spring never sees it and the transaction commits; and if a nested transaction already marked the transaction rollback-only, you get `UnexpectedRollbackException` at commit time.
 
-### Q122. Isolation levels
+### Q133. Isolation levels
 
 `READ_UNCOMMITTED` allows dirty reads. `READ_COMMITTED` prevents dirty reads (PostgreSQL and Oracle default). `REPEATABLE_READ` also prevents non-repeatable reads (MySQL InnoDB default; and InnoDB's gap locks prevent most phantoms too). `SERIALIZABLE` prevents phantoms, at the cost of heavy locking or serialization failures you must retry.
 
 Practical stance: keep `READ_COMMITTED` and solve the specific anomaly with optimistic locking (`@Version`) or an explicit `SELECT ... FOR UPDATE`, rather than raising the isolation level globally and paying for it everywhere.
 
-### Q123. `@Async`
+### Q134. `@Async`
 
 Backed by the same proxy mechanism, so the same self-invocation rule applies: an internal call runs synchronously. The method must return `void`, `Future`, or `CompletableFuture` - anything else and the return value is meaningless.
 
 Configure your own executor; the default `SimpleAsyncTaskExecutor` (pre-Boot 3.2 behavior) creates a new thread per call and does not pool, which is unusable in production. Also note that exceptions from `void` async methods vanish unless you register an `AsyncUncaughtExceptionHandler`, and that `SecurityContext` and MDC do not propagate unless you configure a `TaskDecorator` (or set `DelegatingSecurityContextAsyncTaskExecutor`).
 
-### Q124. `@Async` plus `@Transactional` `[T]`
+### Q135. `@Async` plus `@Transactional` `[T]`
 
 Two proxies stack, and the transaction is bound to a thread via `ThreadLocal`. The async method runs on a different thread, so it does not inherit the caller's transaction - it starts its own, or none. Consequences: entities passed as arguments are detached in the new thread (`LazyInitializationException`), the caller's transaction may commit or roll back independently, and the async work can read pre-commit state.
 
 Correct pattern: commit first, then trigger async work - ideally via `@TransactionalEventListener(phase = AFTER_COMMIT)` - and pass IDs rather than entities so the async method reloads within its own transaction.
 
-### Q125. Circular dependencies
+### Q136. Circular dependencies
 
 With field or setter injection Spring resolves cycles using the early-reference cache in `DefaultSingletonBeanRegistry` (the three-level cache), exposing a partially constructed bean. With constructor injection it cannot - neither bean can be created first - so it throws `BeanCurrentlyInCreationException`. Since Boot 2.6 circular references are disallowed by default.
 
 `@Lazy` on one side works by injecting a proxy, and it is a legitimate escape hatch, but a cycle almost always signals a missing third component or a misplaced responsibility. I treat it as a design bug and extract the shared behavior.
 
-### Q126. Configuration
+### Q137. Configuration
 
 Precedence, highest first: command-line args, `SPRING_APPLICATION_JSON`, OS environment variables, `application-{profile}.yml` outside the jar, then inside, `application.yml` outside then inside, `@PropertySource`, defaults. Config Data imports (`spring.config.import`) let you pull in AWS Parameter Store or Vault.
 
@@ -877,25 +1081,25 @@ Precedence, highest first: command-line args, `SPRING_APPLICATION_JSON`, OS envi
 
 Profiles: keep them for environment shape (`dev`, `prod`), not for business logic, and avoid profile-conditional beans that change behavior in ways tests never exercise.
 
-### Q127. Actuator
+### Q138. Actuator
 
 Expose `/health` (with `liveness` and `readiness` groups for Kubernetes), `/info`, `/metrics` and `/prometheus`. Guard `/env`, `/configprops`, `/heapdump`, `/threaddump`, `/loggers` and `/mappings` behind authentication, because they leak configuration and secrets.
 
 My production setup: put actuator on a separate management port not exposed by the ingress, require an authenticated role for anything beyond health, set `management.endpoint.health.show-details=when-authorized`, and write custom `HealthIndicator`s only for dependencies whose failure should actually take the instance out of rotation - a common mistake is failing readiness because a non-critical downstream is down, which turns a partial outage into a total one.
 
-### Q128. Testing strategy
+### Q139. Testing strategy
 
 Pyramid: a large base of plain JUnit + Mockito unit tests with no Spring context (milliseconds); a middle tier of slice tests (`@WebMvcTest`, `@DataJpaTest`, `@JsonTest`, `@RestClientTest`) that load only the relevant part; a thin top of `@SpringBootTest` integration tests against Testcontainers for real Postgres/Kafka/LocalStack; and contract tests (Spring Cloud Contract or Pact) at service boundaries so consumer expectations are verified without a full end-to-end environment.
 
 I also insist on `@DirtiesContext` being rare, on deterministic time via an injected `Clock`, and on no `Thread.sleep` in tests - use Awaitility.
 
-### Q129. `@MockBean` and context caching `[T]`
+### Q140. `@MockBean` and context caching `[T]`
 
 Spring caches application contexts across test classes keyed by their configuration. `@MockBean` changes that key, so every distinct combination of mocks creates and starts a *new* context - which for a large app can be several seconds each and dominates suite runtime.
 
 Mitigations: group mocks into a shared test configuration so the key is reused, prefer constructor injection with plain Mockito in unit tests, use slice tests, and inspect `spring.test.context.cache.maxSize` and the context-cache statistics logging to see how many contexts you are creating. Spring Framework 6.2 `@MockitoBean` behaves the same way regarding the cache key.
 
-### Q130. MVC versus WebFlux `[A]`
+### Q141. MVC versus WebFlux `[A]`
 
 WebFlux earns its place when you have very high concurrency with mostly IO-bound work and a fully reactive downstream stack (R2DBC, reactive Mongo, reactive HTTP client), or when you need streaming/backpressure semantics such as SSE fan-out to many clients.
 
@@ -903,7 +1107,7 @@ Costs are real: a steep learning curve, painful debugging (no meaningful stack t
 
 In 2026 my default answer is: with virtual threads, Spring MVC gives you most of WebFlux's concurrency benefit with none of the cognitive cost, so I choose MVC + virtual threads unless I specifically need streaming or backpressure.
 
-### Q131. HTTP clients
+### Q142. HTTP clients
 
 `RestTemplate` is in maintenance mode - synchronous, still supported, still everywhere in legacy code. `WebClient` is the reactive, non-blocking client and works fine in a blocking app via `.block()`, though that wastes its advantage. The JDK `HttpClient` (Java 11+) is a solid dependency-free option with HTTP/2 support.
 
@@ -913,7 +1117,7 @@ In 2026 I use Spring's `RestClient` for synchronous calls - it has WebClient's f
 
 ## 8. Spring Security, authentication and authorization
 
-### Q132. The filter chain
+### Q143. The filter chain
 
 A single `DelegatingFilterProxy` registered in the servlet container delegates to `FilterChainProxy`, which selects the first matching `SecurityFilterChain`. Typical order:
 
@@ -932,11 +1136,11 @@ A single `DelegatingFilterProxy` registered in the servlet container delegates t
 
 Authentication happens in step 7; authorization in step 12. `ExceptionTranslationFilter` sits *above* the authorization filter precisely so it can catch its exceptions.
 
-### Q133. Authentication components
+### Q144. Authentication components
 
 The filter builds an unauthenticated `Authentication` token and passes it to `AuthenticationManager` (usually `ProviderManager`), which walks a list of `AuthenticationProvider`s asking `supports(tokenType)`. `DaoAuthenticationProvider` loads the user through `UserDetailsService`, verifies the password with `PasswordEncoder`, and returns a fully populated `Authentication` with authorities. The filter stores it in `SecurityContextHolder`, which is `ThreadLocal`-backed (hence the propagation problem on async threads), and the `SecurityContextRepository` persists it for session-based flows.
 
-### Q134. Sessions versus JWT
+### Q145. Sessions versus JWT
 
 Sessions: server-side state, instantly revocable, opaque to the client, small cookie; cost is sticky sessions or a shared store (Redis via Spring Session), which is a scaling and availability concern but a solved one.
 
@@ -944,7 +1148,7 @@ JWT: self-contained, stateless, verifiable without a lookup, good for cross-serv
 
 My default for a first-party web app is sessions with Redis - the "stateless is simpler" argument usually evaporates once you add a revocation list. JWTs I use for service-to-service and for genuinely federated scenarios, with short lifetimes.
 
-### Q135. Revoking a JWT `[T]`
+### Q146. Revoking a JWT `[T]`
 
 You cannot un-issue it, so every option is a compromise:
 
@@ -955,7 +1159,7 @@ You cannot un-issue it, so every option is a compromise:
 
 The honest interview answer is to name the trade-off explicitly: stateless authentication and immediate revocation are fundamentally in tension; pick which one the requirement actually needs.
 
-### Q136. Access and refresh tokens
+### Q147. Access and refresh tokens
 
 Access token: short-lived (5-15 min), sent on every request, carries claims. Refresh token: long-lived (days to weeks), used only against the token endpoint, stored server-side or at minimum tracked.
 
@@ -963,31 +1167,31 @@ Storage: for browsers, a refresh token in an `HttpOnly`, `Secure`, `SameSite=Str
 
 Rotation: issue a new refresh token on every use and invalidate the previous one. Reuse detection - if an already-used refresh token is presented, the token family has leaked, so revoke the whole family and force re-authentication. That is what turns rotation from cosmetic into a real defense.
 
-### Q137. Grant types in 2026
+### Q148. Grant types in 2026
 
 Recommended: **Authorization Code + PKCE** for all interactive clients including SPAs and mobile, and **Client Credentials** for machine-to-machine. **Device Code** for input-constrained devices.
 
 Deprecated by the OAuth 2.1 / Security BCP direction: **Implicit** (tokens in the URL fragment, no refresh, leaks through history and referrers) and **Resource Owner Password Credentials** (the client handles the user's password, defeats federation and MFA). Both should be treated as unavailable in a new design.
 
-### Q138. OAuth2 versus OIDC
+### Q149. OAuth2 versus OIDC
 
 OAuth2 is an *authorization* framework: it gets a client a token to access a resource. It says nothing about who the user is - using an access token to infer identity is the classic mistake.
 
 OIDC is an identity layer on top: it adds the `id_token` (a signed JWT with standard claims: `sub`, `iss`, `aud`, `exp`, `nonce`), the `/userinfo` endpoint, standard scopes (`openid`, `profile`, `email`), and discovery via `/.well-known/openid-configuration` with a JWKS endpoint for key rotation. If you need to know *who* the user is, you need OIDC.
 
-### Q139. PKCE
+### Q150. PKCE
 
 Proof Key for Code Exchange. The client generates a random `code_verifier`, sends `code_challenge = SHA256(verifier)` with the authorization request, and must present the original verifier when exchanging the code for tokens.
 
 It prevents authorization code interception: on mobile, a malicious app registering the same custom URL scheme could steal the code; in a browser, the code can leak through logs, referrers or history. Without PKCE, whoever holds the code can redeem it (public clients have no secret). With PKCE, the code is useless without the verifier. It is now recommended for confidential clients too.
 
-### Q140. JWT in `localStorage` `[T]`
+### Q151. JWT in `localStorage` `[T]`
 
 `localStorage` is readable by any JavaScript on the origin, so a single XSS - including one in a third-party dependency - exfiltrates the token, and the attacker then holds a valid credential until it expires, off your machine and beyond your reach.
 
 Alternative: an `HttpOnly`, `Secure`, `SameSite` cookie, which JavaScript cannot read. That reintroduces CSRF exposure, so pair it with `SameSite=Lax/Strict` and a CSRF token for state-changing requests. The pragmatic pattern is: refresh token in an `HttpOnly` cookie, access token held in a JavaScript closure in memory only (lost on refresh, re-obtained silently). And none of this substitutes for eliminating the XSS: a strict Content Security Policy and output encoding are the primary control.
 
-### Q141. CSRF
+### Q152. CSRF
 
 The attacker makes the victim's browser send an authenticated request to your site using credentials the browser attaches *automatically*. That is the key condition - it applies to cookies and HTTP Basic, not to an `Authorization: Bearer` header that JavaScript must add deliberately.
 
@@ -995,7 +1199,7 @@ So a purely token-based API can disable CSRF. You must keep it on when: any auth
 
 Defenses: synchronizer token or double-submit cookie (Spring's `CookieCsrfTokenRepository`), plus `SameSite` cookies as defense in depth.
 
-### Q142. CORS
+### Q153. CORS
 
 CORS is a *browser* enforcement mechanism that relaxes the same-origin policy. A non-simple request triggers a preflight `OPTIONS` carrying `Origin`, `Access-Control-Request-Method` and headers, and the server replies with the allowed set.
 
@@ -1003,13 +1207,13 @@ Two things to say in an interview: CORS is not authorization - it does not prote
 
 Configure it once, in Spring Security's `cors()` backed by a `CorsConfigurationSource`, not with scattered `@CrossOrigin` annotations - and note the CORS filter must run before authentication so preflights are not rejected with a 401.
 
-### Q143. Method security
+### Q154. Method security
 
 Enable with `@EnableMethodSecurity`. `@PreAuthorize` evaluates before invocation and takes SpEL: `@PreAuthorize("hasRole('ADMIN') or #userId == authentication.principal.id")`. `@PostAuthorize` runs after and can inspect the return value (`returnObject.ownerId == authentication.name`) - useful, but the method has already executed, so any side effect has happened. `@Secured` and JSR-250 `@RolesAllowed` are role-only and less expressive. `@PreFilter`/`@PostFilter` filter collections, which is elegant but do not use `@PostFilter` on a large result set - filter in the query instead.
 
 Note it is AOP-based, so the same self-invocation limitation applies, and remember `hasRole('ADMIN')` implicitly prepends `ROLE_` while `hasAuthority('ADMIN')` does not - a frequent source of "why is my rule not matching".
 
-### Q144. Multi-tenant authorization
+### Q155. Multi-tenant authorization
 
 Layered, because a single control will eventually be bypassed:
 
@@ -1021,13 +1225,13 @@ Layered, because a single control will eventually be bypassed:
 
 The strongest isolation is separate schemas or databases per tenant; it costs migration complexity and connection pool pressure, but for regulated data it is often the only defensible answer.
 
-### Q145. Password hashing
+### Q156. Password hashing
 
 Use a memory-hard, deliberately slow algorithm with a per-password salt. **Argon2id** is the current recommendation (OWASP: 19 MiB memory, 2 iterations, 1 degree of parallelism as a baseline). **BCrypt** remains acceptable with a work factor of 10-12 and is what Spring's `DelegatingPasswordEncoder` defaults to; note its 72-byte input truncation. **PBKDF2** when FIPS compliance forces it, at 600k+ iterations for SHA-256.
 
 Choose the cost by measuring: tune so hashing takes roughly 250-500ms on production hardware, then re-evaluate annually. Use `DelegatingPasswordEncoder` so the stored hash carries its algorithm prefix (`{bcrypt}`, `{argon2}`) and you can upgrade in place on successful login.
 
-### Q146. OWASP Top 10 with Java mitigations
+### Q157. OWASP Top 10 with Java mitigations
 
 1. **Broken Access Control** - deny by default, enforce server-side per resource, never trust client-supplied IDs; test for IDOR.
 2. **Cryptographic Failures** - TLS everywhere, AES-GCM, no MD5/SHA-1 for passwords, no hardcoded keys, use KMS.
@@ -1040,7 +1244,7 @@ Choose the cost by measuring: tune so hashing takes roughly 250-500ms on product
 9. **Logging and Monitoring Failures** - log authentication events and authorization denials, never log secrets or tokens, alert on anomalies.
 10. **SSRF** - allowlist outbound destinations, block link-local `169.254.169.254`, use IMDSv2, resolve and validate the IP after redirects.
 
-### Q147. SQL injection in JPA `[T]`
+### Q158. SQL injection in JPA `[T]`
 
 Prepared statements protect *parameter values*, not query structure. Injection still occurs through:
 
@@ -1052,13 +1256,13 @@ Prepared statements protect *parameter values*, not query structure. Injection s
 
 Rule: every user-controlled value is a bound parameter; every user-controlled *identifier* is checked against a fixed allowlist. Add static analysis to catch concatenation into query strings.
 
-### Q148. Secrets in Spring Boot on AWS
+### Q159. Secrets in Spring Boot on AWS
 
 No secrets in `application.yml`, environment variables in a manifest, or the container image. Use AWS Secrets Manager (supports rotation, encrypted with KMS) or Parameter Store SecureString for lower-cost cases, loaded via `spring.config.import=aws-secretsmanager:` from Spring Cloud AWS, with the task or pod assuming an IAM role (IRSA on EKS, task role on ECS) so there are no static credentials anywhere.
 
 For databases, prefer IAM authentication or Secrets Manager-managed rotation with a short-lived credential. Add: least-privilege IAM per service, secret scanning in CI (gitleaks) and a pre-commit hook, audit access via CloudTrail, and a documented rotation runbook. If a secret ever reaches git history, treat it as compromised and rotate - removing the commit is not remediation.
 
-### Q149. Zero-trust service-to-service `[A]`
+### Q160. Zero-trust service-to-service `[A]`
 
 Assume the network is hostile; every call is authenticated and authorized regardless of origin.
 
@@ -1070,13 +1274,13 @@ Supporting practices: no long-lived credentials, deny-by-default policies as cod
 
 ## 9. Databases, JPA and persistence
 
-### Q150. Entity lifecycle
+### Q161. Entity lifecycle
 
 **Transient**: new, no identity, not tracked. **Managed**: attached to a persistence context; changes are auto-flushed at commit through dirty checking (which is why calling a setter without any `save()` still writes). **Detached**: has identity but the context is closed; lazy loads fail; `merge()` reattaches a copy. **Removed**: scheduled for deletion at flush.
 
 The dirty-checking behavior is the one that catches people: modifying a managed entity inside a transaction persists whether or not you intended it.
 
-### Q151. N+1 selects `[T]`
+### Q162. N+1 selects `[T]`
 
 One query fetches N parents, then accessing a lazy association fires one query per parent - N+1 round trips. It is invisible in a small dev dataset and lethal in production.
 
@@ -1090,7 +1294,7 @@ Fixes and their drawbacks:
 
 Detection: enable `hibernate.generate_statistics`, assert query counts in integration tests, and use datasource-proxy or Hypersistence Utils to fail a test when the count exceeds a threshold. That is how you keep it from coming back.
 
-### Q152. `LazyInitializationException` `[T]`
+### Q163. `LazyInitializationException` `[T]`
 
 Lazy associations are proxies that need an open session. Once the transaction ends and the session closes, touching the proxy throws.
 
@@ -1098,7 +1302,7 @@ The wrong fixes: switching to `EAGER` (now you over-fetch on every query, everyw
 
 The right fixes: fetch what you need inside the transaction using a fetch join or entity graph; or map to a DTO inside the transactional boundary so nothing lazy escapes; or use `Hibernate.initialize()` deliberately where a conditional load is genuinely needed.
 
-### Q153. Caching levels
+### Q164. Caching levels
 
 First-level cache is the persistence context - per transaction, mandatory, gives you identity guarantees within a session. Second-level is shared across sessions per `SessionFactory` (Ehcache, Hazelcast, Infinispan), plus an optional query cache.
 
@@ -1106,7 +1310,7 @@ Dangers: stale data when anything writes to the database outside Hibernate (bulk
 
 I enable the second-level cache only for genuinely read-mostly reference data, and I prefer an explicit application cache (Caffeine or Redis) over the entity cache, because the invalidation rules are then visible rather than implicit.
 
-### Q154. Locking
+### Q165. Locking
 
 **Optimistic**: a `@Version` column; on update Hibernate adds `WHERE version = ?` and throws `OptimisticLockException` if zero rows changed. No locks held, so it scales; the caller must handle the conflict, usually by reloading and retrying. Default choice for user-facing edits.
 
@@ -1114,7 +1318,7 @@ I enable the second-level cache only for genuinely read-mostly reference data, a
 
 Always set a lock timeout (`jakarta.persistence.lock.timeout`) with pessimistic locks so a stuck transaction does not cascade.
 
-### Q155. Bidirectional `@OneToMany`
+### Q166. Bidirectional `@OneToMany`
 
 The **`@ManyToOne` side owns the relationship** because it holds the foreign key. `mappedBy` on the `@OneToMany` side declares it as the inverse, non-owning side.
 
@@ -1127,19 +1331,19 @@ public void removeItem(Item item) { items.remove(item); item.setOrder(null); }
 
 Also: use `Set` with a stable `equals`/`hashCode` (based on a business key, not the generated ID, which is null before persist), and avoid `@OneToMany` without `mappedBy`, which creates a surprise join table.
 
-### Q156. `CascadeType.REMOVE` on a large collection `[T]`
+### Q167. `CascadeType.REMOVE` on a large collection `[T]`
 
 Hibernate must load every child entity to apply lifecycle callbacks and fire an individual `DELETE` per row - so deleting a parent with 100,000 children loads 100,000 objects into the persistence context and issues 100,000 statements. Memory and transaction duration both explode, and it silently gets worse as data grows.
 
 Alternatives: a bulk `DELETE FROM child WHERE parent_id = ?` (then clear the persistence context, because bulk operations bypass it), a database-level `ON DELETE CASCADE` foreign key, or soft delete plus an asynchronous purge job. Also note `orphanRemoval = true` has the same characteristics.
 
-### Q157. `save`, `saveAndFlush`, `persist`, `merge`
+### Q168. `save`, `saveAndFlush`, `persist`, `merge`
 
 `persist` makes a *new* entity managed and throws if it already has an identifier that exists. `merge` copies the state of a detached instance into a managed copy and **returns that copy** - the instance you passed in remains detached, which is the classic "my changes disappeared" bug.
 
 Spring Data's `save` delegates to `persist` when `isNew()` is true and `merge` otherwise. `saveAndFlush` additionally forces the SQL to be issued immediately rather than at commit - useful when you need a generated value or want a constraint violation to surface at a known point, but it forfeits batching.
 
-### Q158. Efficient pagination
+### Q169. Efficient pagination
 
 `OFFSET n` makes the database scan and discard n rows, so page 10,000 is slow and cost grows linearly with depth. Worse, with concurrent inserts, rows shift between pages so users see duplicates or gaps.
 
@@ -1147,19 +1351,19 @@ Use **keyset (seek) pagination**: `WHERE (created_at, id) < (:lastCreatedAt, :la
 
 Also avoid `COUNT(*)` on every page request; use an estimated count or `Slice` instead of `Page` in Spring Data.
 
-### Q159. Indexing
+### Q170. Indexing
 
 Composite index column order follows the **leftmost prefix rule**: an index on `(a, b, c)` serves predicates on `a`, `a,b`, and `a,b,c` - not on `b` alone. Order by equality predicates first, then range, then the sort column. A **covering index** includes every column the query touches (via `INCLUDE` in Postgres) so the plan is index-only, skipping the heap fetch.
 
 Reasons an index is ignored: a function or implicit cast on the indexed column (`WHERE lower(email) = ?` needs a functional index), leading wildcard `LIKE '%x'`, low selectivity where a sequential scan is genuinely cheaper, stale statistics, or type mismatch between parameter and column. Also remember every index slows writes and consumes memory, so unused indexes should be dropped - `pg_stat_user_indexes` tells you which.
 
-### Q160. Execution plans
+### Q171. Execution plans
 
 `EXPLAIN (ANALYZE, BUFFERS)` in Postgres gives estimated *and* actual rows plus IO. What I look at: a large divergence between estimated and actual rows (stale statistics or a correlation the planner cannot see), sequential scans on large tables in a selective query, nested loops with a high inner row count, sorts spilling to disk (`external merge Disk:`), and high `shared read` versus `shared hit` indicating cache misses.
 
 Actions in order: fix the query shape, add or reorder an index, `ANALYZE` to refresh statistics, increase `work_mem` for a sort, or restructure into a materialized view if the aggregate is genuinely expensive and slightly stale data is acceptable.
 
-### Q161. HikariCP sizing
+### Q172. HikariCP sizing
 
 The pool is a concurrency limit, not a performance dial. A larger pool means more concurrent queries competing for the same finite CPUs and disks, and past the saturation point throughput flattens while latency rises - plus you risk exhausting the database's own `max_connections` across all instances.
 
@@ -1167,7 +1371,7 @@ HikariCP's own guidance: `connections = ((core_count × 2) + effective_spindle_c
 
 Set `connectionTimeout` (fail fast rather than pile up), `maxLifetime` shorter than any database or load-balancer idle timeout, `leakDetectionThreshold` in non-production, and alert on `hikaricp_connections_pending` - queueing there is the single best early warning of database trouble.
 
-### Q162. SQL versus NoSQL `[A]`
+### Q173. SQL versus NoSQL `[A]`
 
 I start from access patterns, not from the data. Questions: what are the top five queries by volume; do we need multi-entity transactions; is the schema stable or genuinely heterogeneous; what is the read/write ratio and the growth curve; what consistency does the business actually require?
 
@@ -1175,7 +1379,7 @@ Relational is my default because ACID transactions, joins, ad-hoc querying and m
 
 The failure mode I have seen most often is choosing a document store for relational data and then reimplementing joins in application code - so I ask "what query becomes impossible if we choose this?" before committing.
 
-### Q163. Zero-downtime migrations
+### Q174. Zero-downtime migrations
 
 Rules, all following from the fact that old and new code run simultaneously during a rollout:
 
@@ -1188,7 +1392,7 @@ Rules, all following from the fact that old and new code run simultaneously duri
 
 Flyway with versioned, immutable, checksum-verified scripts run as a separate pipeline step or init container - not on application startup in a multi-instance deployment, where several instances race (or use Flyway's lock and accept the startup delay).
 
-### Q164. Changing a column type on 500M rows `[A]`
+### Q175. Changing a column type on 500M rows `[A]`
 
 Never `ALTER TABLE ... ALTER COLUMN TYPE` directly - it rewrites the whole table under an exclusive lock.
 
@@ -1209,7 +1413,7 @@ Throughout: feature-flag the read switch so rollback is instant, run the backfil
 
 ## 10. Microservices, APIs and distributed systems
 
-### Q165. Service boundaries `[A]`
+### Q176. Service boundaries `[A]`
 
 I derive boundaries from bounded contexts and from the *rate and reason of change*, not from nouns or from team structure alone (though Conway's Law means team structure will win if I ignore it, so I align them deliberately).
 
@@ -1217,7 +1421,7 @@ Signals a boundary is wrong: two services always deploy together; a change to on
 
 My practical approach is to start with a modular monolith with enforced module boundaries (ArchUnit, package-private APIs), let the seams prove themselves under real change, and extract a service only when there is a concrete driver: independent scaling, independent deployment cadence, different reliability requirement, or team autonomy.
 
-### Q166. Monolith versus microservices in 2026 `[A]`
+### Q177. Monolith versus microservices in 2026 `[A]`
 
 I recommend staying monolithic when the team is under roughly 20-30 engineers, the domain is not yet stable, deployment frequency is not the bottleneck, and the organization lacks the platform maturity - CI/CD, observability, on-call, infrastructure as code - to operate a distributed system.
 
@@ -1225,7 +1429,7 @@ The costs people underestimate: every in-process call becomes a network call tha
 
 What I actually advocate is a modular monolith with clean internal boundaries and an independent deployment path, extracting services where there is a measured need. That preserves the option value without paying the premium up front.
 
-### Q167. REST, idempotency and status codes
+### Q178. REST, idempotency and status codes
 
 Richardson maturity: level 0 (single endpoint, RPC over HTTP), 1 (resources), 2 (HTTP verbs and status codes - where most real APIs sit and where I stop unless there is a reason), 3 (HATEOAS, rarely worth it for internal APIs).
 
@@ -1233,13 +1437,13 @@ Idempotency by method: `GET`, `PUT`, `DELETE` and `HEAD` are idempotent by speci
 
 Status codes: 200 with a body, 201 with a `Location` header for creation, 202 for accepted-but-async, 204 for a successful delete or empty response, 400 for malformed syntax, 401 unauthenticated versus 403 unauthorized, 404 for missing (and deliberately for "exists but you may not see it", to avoid leaking existence), 409 for conflict such as an optimistic-lock failure, 412 for a failed precondition, 422 for semantically invalid input, 429 with `Retry-After`, 503 with `Retry-After` for shedding load. Errors should follow RFC 9457 `application/problem+json` so clients can parse them uniformly.
 
-### Q168. Versioning
+### Q179. Versioning
 
 Options: URI path (`/v1/orders`) - visible, cacheable, trivially routable, and my default for public APIs despite purist objections; custom header or `Accept` media type versioning - cleaner URLs but harder to test and to route at the edge; query parameter - avoid.
 
 The more important half is the policy: version only on *breaking* changes, and make additive changes non-breaking by having clients tolerate unknown fields (Postel's law, enforced in the client library). Publish a deprecation policy with a fixed support window, emit `Deprecation` and `Sunset` headers (RFC 8594), instrument per-version usage so you know exactly who is left, contact those consumers directly, and only then retire. Never run more than two major versions - the maintenance cost is what actually kills you, so the discipline is aggressive retirement, not clever versioning.
 
-### Q169. CAP and PACELC
+### Q180. CAP and PACELC
 
 CAP: during a network **partition**, you must choose between consistency and availability. The common misstatement is "pick two of three" - partition tolerance is not optional in a distributed system, so the real choice is CP or AP, and only while partitioned.
 
@@ -1247,13 +1451,13 @@ PACELC is more useful because it describes the other 99.9 percent of the time: *
 
 Framing it this way in an interview signals you have operated these systems rather than read about them.
 
-### Q170. Explaining eventual consistency
+### Q181. Explaining eventual consistency
 
 To a product owner I do not use the term. I say: "When you change this, the update is guaranteed, but it may take up to a few seconds to appear on that other screen. What should the user see during that window?" That converts an architecture property into a product decision they can actually make.
 
 Making it acceptable in the UI: read-your-own-writes for the acting user (route their reads to the leader, or optimistically render their own change), explicit pending states rather than silently stale data, and a bounded, monitored staleness window with an SLO ("99.9 percent of updates visible within 2 seconds"). Where the business genuinely cannot tolerate it - money movement, inventory at the point of sale - I keep that specific operation strongly consistent rather than arguing.
 
-### Q171. Sagas
+### Q182. Sagas
 
 A long-lived business transaction split into local transactions, each with a compensating action, because a distributed two-phase commit is not viable across services.
 
@@ -1263,7 +1467,7 @@ A long-lived business transaction split into local transactions, each with a com
 
 I use orchestration for anything with more than three steps or with money involved, because operability matters more than coupling purity. Either way the hard parts are the same: compensations are semantic, not rollbacks (you refund, you do not un-charge), steps must be idempotent because retries are certain, and you need to handle the semantic lock problem - data is visible in an intermediate state, so model it explicitly (`PENDING`, `RESERVED`) rather than pretending it is atomic.
 
-### Q172. Transactional outbox `[T]`
+### Q183. Transactional outbox `[T]`
 
 The problem is the dual-write: you cannot atomically commit to your database *and* publish to a broker. If you save then publish and the process dies in between, the state changed but nobody was told. If you publish then save and the save fails, you have announced something that never happened. Wrapping both in a distributed transaction (XA) is slow, poorly supported, and puts a broker outage in your write path.
 
@@ -1271,7 +1475,7 @@ The outbox writes the event **into a table in the same local transaction** as th
 
 This gives at-least-once delivery, never zero, so consumers must be idempotent. The inverse pattern on the consumer side is the inbox: record processed message IDs in the same transaction as the effect, so redelivery is a no-op.
 
-### Q173. Idempotent payment API
+### Q184. Idempotent payment API
 
 The client generates an `Idempotency-Key` (a UUID) per logical operation and resends the same key on every retry.
 
@@ -1281,7 +1485,7 @@ Also: give keys a defined retention (24 hours is typical) documented to clients,
 
 > *Hook: a payments or ordering flow where duplicate submissions were eliminated.*
 
-### Q174. Exactly-once
+### Q185. Exactly-once
 
 End-to-end exactly-once *delivery* is impossible in an asynchronous system with failures - the classic two-generals result. What is achievable is exactly-once **processing**, by combining at-least-once delivery with idempotent or transactional effects.
 
@@ -1289,7 +1493,7 @@ What Kafka actually gives you: an idempotent producer (a producer ID and sequenc
 
 So my answer is always: design consumers to be idempotent, use a dedup key or an inbox table, and treat Kafka transactions as an optimization for Kafka-to-Kafka pipelines rather than a general guarantee.
 
-### Q175. Kafka fundamentals
+### Q186. Kafka fundamentals
 
 A topic is split into **partitions**, which are the unit of parallelism and of ordering - ordering is guaranteed *within* a partition only, and the partition is chosen by `hash(key) % partitions`, so keying by entity ID gives per-entity ordering.
 
@@ -1297,7 +1501,7 @@ A **consumer group** distributes partitions among members; one partition is cons
 
 **Offsets** are consumer-controlled. Auto-commit gives at-most-once or at-least-once depending on timing, both accidentally; I disable it and commit after processing, accepting at-least-once and making the handler idempotent. Durability comes from `acks=all` plus `min.insync.replicas=2` on a replication factor of 3 - `acks=1` will lose data on a leader failure.
 
-### Q176. Increasing partitions `[T]`
+### Q187. Increasing partitions `[T]`
 
 Ordering breaks for existing keys. The partition is `hash(key) % partitionCount`, so changing the count remaps keys: messages for key K written before the change sit in partition 3, and new ones go to partition 7. Two consumers now process that key's history and its future concurrently, with no ordering relationship between them.
 
@@ -1305,7 +1509,7 @@ Also: partitions can only be increased, never decreased, and log-compacted topic
 
 Mitigations: over-provision partitions at topic creation (they are cheap up to a point); or create a new topic with the new partition count and migrate consumers with a controlled cut-over; or use a custom partitioner with consistent hashing if you must scale live. In practice, plan capacity up front - this is one of the few Kafka decisions that is genuinely hard to undo.
 
-### Q177. Trace context propagation
+### Q188. Trace context propagation
 
 W3C Trace Context (`traceparent` / `tracestate` headers) carries the trace ID, span ID and sampling flag. On synchronous HTTP calls, instrumentation copies it automatically.
 
@@ -1313,7 +1517,7 @@ Async boundaries are where it breaks, because the context lives in a `ThreadLoca
 
 Then make it useful: put the trace ID in the MDC so every log line carries it, return it in an error response header so support can jump from a customer complaint straight to the trace, and sample tail-based on errors and latency so you keep the traces that matter.
 
-### Q178. Discovery, load balancing and mesh
+### Q189. Discovery, load balancing and mesh
 
 **Server-side**: clients call a stable endpoint (ALB, Kubernetes Service) that distributes traffic. Simple, language-agnostic, one more network hop, and the balancer has no view of application-level health beyond a probe.
 
@@ -1323,7 +1527,7 @@ Then make it useful: put the trace ID in the MDC so every log line carries it, r
 
 My position: on Kubernetes, start with Services plus client-side resilience libraries; adopt a mesh when you need mTLS everywhere, uniform traffic policy across polyglot services, or progressive delivery - not because it is fashionable.
 
-### Q179. Rate limiting
+### Q190. Rate limiting
 
 **Token bucket**: tokens refill at a fixed rate up to a capacity; allows bursts up to the bucket size. My default, and what most cloud gateways implement. **Leaky bucket**: outflow is strictly constant, smoothing traffic entirely - good for protecting a downstream with a hard throughput limit. **Fixed window**: trivial but allows a 2x burst across the window boundary. **Sliding window log** is exact but stores every timestamp; **sliding window counter** interpolates between two fixed windows and is the usual compromise.
 
@@ -1331,7 +1535,7 @@ Where to enforce: at the edge (API Gateway, WAF, ingress) for coarse per-client 
 
 Always return `429` with `Retry-After` and `X-RateLimit-*` headers, and rate limit by authenticated identity rather than IP where possible, since NAT makes IP a poor key.
 
-### Q180. Caching strategies
+### Q191. Caching strategies
 
 **Cache-aside** (lazy loading): the application checks the cache, loads from the source on a miss, and populates. Most common, resilient to cache failure, but the first request per key is slow and it is easy to get inconsistent under concurrent writes. **Read-through**: the cache itself loads on miss, so the loading logic lives in one place. **Write-through**: write to cache and store synchronously - consistent, higher write latency. **Write-behind**: write to cache and flush asynchronously - fastest writes, risk of data loss and much harder recovery; I use it only for tolerable data such as counters.
 
@@ -1339,7 +1543,7 @@ Invalidation: prefer a short TTL plus explicit invalidation on write; version th
 
 **Stampede** (many concurrent misses on the same hot key hitting the database at once) is the failure I actually plan for: use a per-key lock or single-flight so one loader populates while others wait, add jitter to TTLs so keys do not expire in lockstep, and consider probabilistic early refresh so a hot key is refreshed just before it expires. Caffeine's `AsyncLoadingCache` gives you single-flight for free locally; Redis needs an explicit lock.
 
-### Q181. Graceful degradation `[A]`
+### Q192. Graceful degradation `[A]`
 
 The principle is that a partial outage should cause a partial loss of function, not a total one. So I classify every dependency as critical or non-critical up front - if the recommendations service is down, the product page must still render.
 
@@ -1351,7 +1555,7 @@ Then I verify it: chaos experiments and failure injection in staging, plus a gam
 
 ## 11. AWS and cloud architecture
 
-### Q182. Compute decision framework
+### Q193. Compute decision framework
 
 My sequence of questions: what is the traffic shape, what is the required startup latency, how long does a unit of work run, what does the team already operate well, and what is the cost at expected scale?
 
@@ -1362,7 +1566,7 @@ My sequence of questions: what is the traffic shape, what is the required startu
 
 I also state the reversibility: containerized services can move between Fargate and EKS with limited effort, while a deeply Lambda-native design is harder to unwind - so for an uncertain workload I bias toward containers.
 
-### Q183. Lambda cold starts in Java `[T]`
+### Q194. Lambda cold starts in Java `[T]`
 
 Causes, in order of impact: JVM startup, classpath scanning and reflection in Spring or Jakarta EE frameworks, static initialization, and the JIT running interpreted until warm. A Spring Boot Lambda can take 5-10 seconds cold; the same logic in plain Java takes a few hundred milliseconds.
 
@@ -1375,7 +1579,7 @@ Four things that actually work:
 
 Also: trim the deployment package, use tiered compilation stop-at-level-1 (`-XX:TieredStopAtLevel=1 -XX:+TieredCompilation`) for short-lived invocations, and avoid VPC-attached Lambdas unless needed (Hyperplane ENIs removed most of that penalty, but the dependency remains).
 
-### Q184. Messaging service selection
+### Q195. Messaging service selection
 
 - **SQS** - point-to-point work queue, one consumer group, durable, with retries, visibility timeout and DLQ. Default for decoupling a producer from a worker.
 - **SNS** - pub/sub fan-out to multiple subscribers, push-based, with message filtering by attribute. Typically SNS to several SQS queues, which gives fan-out plus per-consumer buffering and retry - the "fan-out pattern".
@@ -1384,13 +1588,13 @@ Also: trim the deployment package, use tiered compilation stop-at-level-1 (`-XX:
 
 The distinguishing question I ask is: does the consumer need to *replay* history, and does order matter? Yes to either points at Kinesis or Kafka; otherwise SQS or EventBridge.
 
-### Q185. SQS standard versus FIFO
+### Q196. SQS standard versus FIFO
 
 **Standard**: nearly unlimited throughput, at-least-once delivery, best-effort ordering. **FIFO**: strict ordering within a message group ID, exactly-once *processing* via a 5-minute deduplication window, and throughput limited to 300 messages/second per group (3,000 with batching, and much higher with high-throughput mode enabled, which relaxes the deduplication scope).
 
 Traps worth naming: the message group ID is the parallelism unit, so using a constant group ID serializes your entire queue; a single poisoned message blocks its whole group until it is moved to the DLQ; and **visibility timeout** must exceed your maximum processing time, or the message reappears and is processed twice while the first attempt is still running - the most common SQS bug there is. Extend it with a heartbeat (`ChangeMessageVisibility`) for long tasks, and always make the consumer idempotent even on FIFO, because "exactly once" only holds within the dedup window.
 
-### Q186. Dead letter queues
+### Q197. Dead letter queues
 
 A message lands in the DLQ after `maxReceiveCount` failed receives - which includes crashes and visibility-timeout expiries, not just explicit failures. That is the point: it stops a poison message from blocking the queue forever and from being retried infinitely at cost.
 
@@ -1398,7 +1602,7 @@ Operationally I treat a DLQ as an alertable condition, never a dumping ground: a
 
 Safe reprocessing: fix the cause first, then use the SQS DLQ redrive feature (or a controlled consumer) to move messages back at a throttled rate, ensure the handler is idempotent because some messages may have partially succeeded, and keep a record of what was redriven and when. For messages that can never succeed, archive them to S3 with the failure reason rather than deleting silently.
 
-### Q187. RDS, Aurora, DynamoDB
+### Q198. RDS, Aurora, DynamoDB
 
 **RDS**: managed conventional engines. Predictable, familiar, cheapest for modest workloads; failover to a standby takes 60-120 seconds; read scaling via read replicas with replication lag.
 
@@ -1408,7 +1612,7 @@ Safe reprocessing: fix the cause first, then use the SQS DLQ redrive feature (or
 
 DynamoDB is the wrong choice when access patterns are unknown or will change, when you need ad-hoc queries, joins, aggregations or reporting, when items are large or transactions span many entities, or when the team lacks single-table-design experience - the schema is a function of your queries, so getting the queries wrong means a migration, not an index. I have seen more failures from choosing DynamoDB for a relational domain than from any other AWS decision.
 
-### Q188. DynamoDB key design
+### Q199. DynamoDB key design
 
 The partition key determines physical distribution: its hash selects a partition, each of which sustains roughly 3,000 read and 1,000 write units per second. A **hot partition** comes from low-cardinality or skewed keys - a status field, a date, a single popular tenant. Fixes: choose a high-cardinality key, add a write-sharding suffix (`key#0..N`) and scatter-gather on read, or split the hot entity out. Adaptive capacity absorbs mild skew automatically but not a sustained hotspot.
 
@@ -1416,7 +1620,7 @@ The sort key enables range queries and the composite-key patterns behind single-
 
 **GSI**: different partition and sort key, its own provisioned capacity, eventually consistent only, and unlimited size - throttling on a GSI throttles writes to the base table, which surprises people. **LSI**: same partition key with an alternate sort key, must be created with the table, supports strongly consistent reads, and constrains the item collection to 10 GB. I use GSIs almost exclusively, and project only the attributes needed to keep them small.
 
-### Q189. IAM and workload credentials
+### Q200. IAM and workload credentials
 
 **Users** hold long-lived credentials and should exist only for genuine break-glass or legacy cases - human access belongs in IAM Identity Center with federated, short-lived sessions. **Roles** are assumed and produce temporary credentials, which is what every workload should use. **Policies** are the permission documents attached to either.
 
@@ -1424,7 +1628,7 @@ How workloads get credentials: an **EC2 instance** uses the instance profile via
 
 The point I make in interviews: no static access keys anywhere in the estate, permissions scoped per workload rather than per environment, and `aws:SourceArn`/`aws:PrincipalOrgID` conditions on trust policies to prevent the confused-deputy problem.
 
-### Q190. Identity versus resource policies `[T]`
+### Q201. Identity versus resource policies `[T]`
 
 Both are evaluated. Within a single account, access is granted if **either** an identity policy or the resource policy allows it, and there is no explicit deny - they are additive. **Across accounts, both must allow**: the caller's identity policy in account A, and the bucket policy in account B. That asymmetry is the answer most candidates miss.
 
@@ -1432,7 +1636,7 @@ Full evaluation order: an explicit `Deny` anywhere wins; then organization SCPs 
 
 Practical use: resource policies are how you grant cross-account access without the other account creating a role, how you enforce `aws:SecureTransport` and encryption conditions on a bucket regardless of who calls, and how you restrict a KMS key. Identity policies are how you manage per-workload least privilege at scale.
 
-### Q191. VPC design
+### Q202. VPC design
 
 Standard shape: a VPC per environment, spread over at least three availability zones, with public subnets holding only load balancers and NAT gateways, private subnets for application compute, and isolated subnets with no outbound route for databases.
 
@@ -1440,7 +1644,7 @@ Cost note worth raising unprompted: NAT gateways are billed hourly *and* per gig
 
 **Security groups** are stateful, instance-level, allow-only, and can reference other security groups - which is how I express "the app tier may reach the database tier" without hardcoding CIDRs. **NACLs** are stateless, subnet-level, ordered, and support explicit deny - I use them only for coarse subnet-level blocks, because stateless rules require matching ephemeral port ranges and are easy to get wrong.
 
-### Q192. Secrets management
+### Q203. Secrets management
 
 **Secrets Manager** for anything requiring rotation or cross-account sharing: native rotation with Lambda for RDS credentials, resource policies, and KMS encryption. Roughly $0.40 per secret per month plus API calls, which matters only if you have thousands.
 
@@ -1450,7 +1654,7 @@ Cost note worth raising unprompted: NAT gateways are billed hourly *and* per gig
 
 Around all of it: least-privilege IAM per secret, CloudTrail auditing of `GetSecretValue`, automatic rotation with a tested rollback, secret scanning in CI and pre-commit, and IAM database authentication where available so there is no password to manage at all.
 
-### Q193. S3 cost reduction
+### Q204. S3 cost reduction
 
 First, measure: S3 Storage Lens and an inventory report tell you what you actually have - I have never seen this analysis fail to find something surprising.
 
@@ -1458,7 +1662,7 @@ Levers, roughly in order of return: enable **Intelligent-Tiering** as the defaul
 
 Then verify with Cost Explorer that the change landed, and put a budget alarm on the bucket's cost allocation tag so it does not drift back.
 
-### Q194. Auto-scaling
+### Q205. Auto-scaling
 
 **Target tracking** keeps a metric at a set point and manages the scaling policy for you - simple, and my default. **Step scaling** applies different adjustments per alarm threshold, useful when you need a large jump under severe load. **Scheduled scaling** for known patterns such as a business-hours workload or a batch window. **Predictive scaling** where the pattern is regular and warm-up time is long.
 
@@ -1466,7 +1670,7 @@ Scaling on CPU is often wrong because CPU is rarely the constraint for a Java se
 
 The other half is getting the dynamics right: scale out fast and in slowly, set the health-check grace period longer than JVM warm-up or you will kill instances mid-start, keep a floor of instances for AZ resilience, and confirm the downstream can absorb the scaled-out fleet - auto-scaling into a fixed-size connection pool just moves the failure.
 
-### Q195. Multi-region active-active `[A]`
+### Q206. Multi-region active-active `[A]`
 
 Shape: Route 53 latency or geolocation routing (with health checks and failover records) into regional stacks, each self-sufficient - ALB, compute, cache and data - with global data replication underneath and CloudFront in front for static and cacheable content.
 
@@ -1478,7 +1682,7 @@ The three hardest problems:
 
 I would also ask what the requirement actually is. If it is disaster recovery with a 15-minute RTO, warm standby is far cheaper and simpler than active-active; active-active earns its cost when you need low latency for globally distributed users or a genuinely zero-RTO regulatory commitment.
 
-### Q196. A 40 percent bill increase `[A]`
+### Q207. A 40 percent bill increase `[A]`
 
 1. **Scope it.** Cost Explorer grouped by service, then by usage type, comparing month over month and daily - a step change points at a deployment or a configuration change; a ramp points at growth or a leak. AWS Cost Anomaly Detection usually flags it first if configured.
 2. **Localize it.** Group by linked account, then by tag (which requires the tagging discipline to already exist - if it does not, that is the first remediation). Correlate the start date against the deployment and infrastructure change log.
@@ -1487,7 +1691,7 @@ I would also ask what the requirement actually is. If it is disaster recovery wi
 
 The framing I use with leadership is cost per unit of business value - cost per request or per tenant - because absolute spend rising alongside traffic is not a problem, and that distinction is what turns the conversation from panic into engineering.
 
-### Q197. Well-Architected in practice
+### Q208. Well-Architected in practice
 
 The six pillars are operational excellence, security, reliability, performance efficiency, cost optimization, and sustainability.
 
@@ -1499,7 +1703,7 @@ I run it as a workshop with the team rather than an audit done to them, prioriti
 
 ## 12. DevOps, CI/CD and observability
 
-### Q198. Pipeline for a Java microservice
+### Q209. Pipeline for a Java microservice
 
 Stages, with the guiding principle that anything that can fail should fail as early and as cheaply as possible:
 
@@ -1513,7 +1717,7 @@ Stages, with the guiding principle that anything that can fail should fail as ea
 
 Cross-cutting: trunk-based development with short-lived branches, the same artifact promoted through every environment (build once), environment differences only in configuration, database migrations as a separate backward-compatible step, and everything in version control including the pipeline itself.
 
-### Q199. Deployment strategies
+### Q210. Deployment strategies
 
 **Rolling**: replace instances in batches. Cheap, no extra infrastructure, and the default in Kubernetes. Requires that two versions coexist safely - both in the API contract and in the database schema.
 
@@ -1523,7 +1727,7 @@ Cross-cutting: trunk-based development with short-lived branches, the same artif
 
 What each requires from the application, which is the real answer: backward and forward compatible APIs and events, backward compatible schema changes, statelessness or externalized session state, graceful shutdown honouring SIGTERM with connection draining, idempotent startup, and readiness probes that are honest about when the instance can serve.
 
-### Q200. Rolling deployments and the schema `[T]`
+### Q211. Rolling deployments and the schema `[T]`
 
 Old and new code run against the **same database at the same time**, so the schema must be compatible with both versions simultaneously. That single fact generates all the rules:
 
@@ -1536,7 +1740,7 @@ Old and new code run against the **same database at the same time**, so the sche
 
 The same reasoning applies to message schemas - a consumer running old code must tolerate events produced by new code, which is why I require schema-registry compatibility checks in CI.
 
-### Q201. Branching for a 30-engineer team
+### Q212. Branching for a 30-engineer team
 
 I recommend **trunk-based development**: short-lived branches merged to main within a day or two, everything behind feature flags, main always releasable, and continuous integration in the literal sense.
 
@@ -1544,7 +1748,7 @@ Why not GitFlow at that size: long-lived `develop` and `release` branches produc
 
 What makes trunk-based work in practice, and what I would put in place first: a fast and trustworthy pipeline (if CI takes 40 minutes or is flaky, people batch changes and the model collapses), feature flags with a discipline for removing them, pull requests small enough to review in 20 minutes, branch protection with required checks, and pair or ensemble programming for the riskiest changes. The branching model is downstream of test quality, so I would fix the pipeline before arguing about branches.
 
-### Q202. Docker image optimization for Java
+### Q213. Docker image optimization for Java
 
 - **Multi-stage build**: compile with the JDK, run on a JRE or a `jlink`-trimmed runtime, so build tooling and source never ship.
 - **Layered JARs**: Spring Boot's layered mode splits dependencies, spring-boot-loader, snapshot dependencies and application classes into separate layers, so a code change re-pushes a few hundred kilobytes instead of the whole fat JAR. Use `bootBuildImage`/buildpacks or an explicit `layertools extract`.
@@ -1556,7 +1760,7 @@ What makes trunk-based work in practice, and what I would put in place first: a 
 
 Worth saying explicitly: image size mostly affects pull time on a cold node, so I optimize layer *churn* first and absolute size second.
 
-### Q203. Container memory exceeding `-Xmx` `[T]`
+### Q214. Container memory exceeding `-Xmx` `[T]`
 
 Because `-Xmx` bounds only the Java heap, and the process needs much more: metaspace, the JIT code cache and compiler arenas, per-thread stacks at ~1 MB each, direct byte buffers (Netty, NIO), GC internal structures, and native allocations from libraries. Total RSS can easily be heap plus 400 MB to 1 GB.
 
@@ -1566,7 +1770,7 @@ Fixes: size the heap as a percentage of the limit (`-XX:MaxRAMPercentage=70`) ra
 
 Then set the Kubernetes memory *request equal to the limit* for a Guaranteed QoS class, so the pod is not evicted under node pressure, and alert on RSS approaching the limit rather than waiting for the OOM kill.
 
-### Q204. Probes
+### Q215. Probes
 
 **Liveness**: is the process irrecoverably broken? Failure restarts the container. Keep it dumb and dependency-free - a check that the process responds. **Readiness**: can this instance serve traffic right now? Failure removes it from the Service endpoints without restarting it, so it is the right place for "dependencies are warming up" or "I am shedding load". **Startup**: gates the other two during a slow boot, which is exactly the Java case - a JVM taking 60 seconds to start would otherwise be killed by liveness before it ever became ready.
 
@@ -1574,7 +1778,7 @@ What breaks when you conflate them: putting a database check in *liveness* means
 
 Spring Boot maps this well: `/actuator/health/liveness` and `/actuator/health/readiness` with `management.endpoint.health.probes.enabled=true`, and readiness automatically flips to `OUT_OF_SERVICE` during graceful shutdown so in-flight requests drain.
 
-### Q205. Requests, limits and the JVM
+### Q216. Requests, limits and the JVM
 
 **Requests** drive scheduling and guarantee a share; **limits** cap usage. For memory the limit is a hard kill - exceed it and the kernel OOM-kills the container, with no grace. For CPU the limit is enforced by CFS quota: the process is *throttled*, not killed, meaning it is descheduled until the next 100 ms period.
 
@@ -1582,7 +1786,7 @@ That throttling is what hurts a JVM. GC threads, JIT compiler threads and applic
 
 My defaults: set memory request equal to limit (Guaranteed QoS, no eviction surprise); set a CPU request that reflects steady-state need and consider omitting the CPU limit for latency-sensitive services (a widely used practice, since requests already provide fair sharing), or set it generously if policy requires one; and pin `-XX:ActiveProcessorCount` when the JVM's detection does not match the quota.
 
-### Q206. Terraform, CloudFormation, CDK
+### Q217. Terraform, CloudFormation, CDK
 
 **Terraform**: multi-cloud, mature module ecosystem, HCL is declarative and readable, and the plan output is the best change-preview of the three. State is the operational burden - remote backend with locking (S3 plus DynamoDB), and state is sensitive because it contains secrets in plaintext.
 
@@ -1592,7 +1796,7 @@ My defaults: set memory request equal to limit (Guaranteed QoS, no eviction surp
 
 My choice depends on context: AWS-only with a strong developer culture, CDK; multi-cloud or a platform team standardizing across providers, Terraform. Either way the practices matter more than the tool - modules with versioned releases, no manual console changes, drift detection running on a schedule (`terraform plan` in CI, or CloudFormation drift detection), policy as code (OPA/Sentinel, cfn-guard) in the pipeline, and separate state per environment. **Drift** is the failure I plan for explicitly: someone will click in the console during an incident, so detection plus a documented reconciliation path is part of the design, not an afterthought.
 
-### Q207. Default instrumentation
+### Q218. Default instrumentation
 
 Every service gets, without anyone asking:
 
@@ -1603,7 +1807,7 @@ Every service gets, without anyone asking:
 
 Then the outputs: a standard dashboard template per service (RED plus saturation), alerts derived from SLOs rather than from thresholds someone guessed, and a runbook link on every alert.
 
-### Q208. SLI, SLO and error budgets
+### Q219. SLI, SLO and error budgets
 
 An **SLI** is a measured ratio of good events to valid events - request success rate, or the fraction of requests served under 300 ms. An **SLO** is the target for that SLI over a window, for example 99.9 percent over 28 rolling days. The **error budget** is the remaining allowance: 99.9 percent over 28 days permits about 40 minutes of failure.
 
@@ -1611,7 +1815,7 @@ How I actually use the budget, which is the part interviewers are testing: it co
 
 Practical requirements: alert on **burn rate**, not on individual failures - a fast burn (2 percent of budget in an hour) pages, a slow burn opens a ticket - which is what eliminates most alert noise. Choose SLIs from the user's perspective, measured at the edge where the user experiences them. Keep the number of SLOs small; three meaningful ones beat twenty nobody trusts. And set the target from what the business actually needs, because every additional nine multiplies cost - most internal services do not need four.
 
-### Q209. Good alerts
+### Q220. Good alerts
 
 A good alert is **symptom-based, actionable, urgent and attributable**: it fires on something a user is experiencing, a human must do something about it now, and there is a documented action. If the answer to "what do I do when this fires?" is "look at it and probably nothing", it should not page.
 
@@ -1621,7 +1825,7 @@ How I eliminate fatigue: alert on SLO burn rate rather than on causes, so one al
 
 The cultural point I make: alert fatigue is not an inconvenience, it is a reliability risk, because the page that matters gets ignored alongside the ones that do not. Tracking pages per on-call shift as a metric, with a target, is what actually drives it down.
 
-### Q210. Blameless postmortems `[A]`
+### Q221. Blameless postmortems `[A]`
 
 The premise is that people act rationally given the information and incentives available to them at the time, so "human error" is the *start* of the investigation, not its conclusion. If an engineer could take down production with one command, the system permitted it - that is the finding.
 
@@ -1635,7 +1839,7 @@ The failure mode to name: a postmortem process that produces documents nobody re
 
 ## 13. AI engineering with Java
 
-### Q211. LLM integration architecture
+### Q222. LLM integration architecture
 
 I treat the model as an unreliable, expensive, non-deterministic external dependency, and the architecture follows from that.
 
@@ -1645,7 +1849,7 @@ Around it: rate limits per tenant, a budget cap that degrades rather than fails,
 
 The point I would make: the model call is 10 percent of the work; the other 90 percent is the retrieval, validation, cost control and evaluation around it.
 
-### Q212. RAG and its failure modes
+### Q223. RAG and its failure modes
 
 RAG retrieves relevant documents from a knowledge base and puts them in the prompt as grounding, so the model answers from your data rather than from its parameters - which fixes staleness, enables citations, and avoids fine-tuning for factual updates.
 
@@ -1658,7 +1862,7 @@ The failure modes of a naive implementation, which is what the question is reall
 - **Stale or unpermissioned index.** Documents change and access control does not carry into the vector store - a genuine data-leak risk in a multi-tenant system. Filter by tenant and ACL *at query time*, not after retrieval.
 - **No evaluation.** Without a measured retrieval hit rate and answer-faithfulness score, every prompt change is a guess.
 
-### Q213. Embeddings and vector search
+### Q224. Embeddings and vector search
 
 An embedding maps text to a dense vector where semantic similarity is geometric proximity. Similarity is almost always **cosine** (magnitude-invariant, and equivalent to dot product on normalized vectors); Euclidean is used occasionally, and the choice must match how the model was trained.
 
@@ -1670,7 +1874,7 @@ An embedding maps text to a dense vector where semantic similarity is geometric 
 
 Operational details worth naming: embeddings must be regenerated when you change the model, so plan for a re-index; normalize vectors once at write time; and store the embedding model version alongside the vector so a mixed index is detectable.
 
-### Q214. Controlling LLM cost and latency
+### Q225. Controlling LLM cost and latency
 
 Cost first, because it is the one that surprises finance:
 
@@ -1689,7 +1893,7 @@ Latency:
 
 Measurement underpins all of it: tokens in, tokens out, cost and latency tagged by feature, tenant, model and prompt version, on a dashboard the team sees weekly. You cannot control what you have not attributed.
 
-### Q215. Prompt injection
+### Q226. Prompt injection
 
 Instructions and data share one channel, so any text the model reads can attempt to redirect it - and unlike SQL injection there is no parameterization that reliably separates them. **Direct** injection is a user typing "ignore your instructions"; **indirect** is the dangerous one, where the payload is planted in a document, web page, email or code comment that your retrieval or browsing tool later ingests.
 
@@ -1706,7 +1910,7 @@ Defense is layered, because no single control holds:
 
 The honest framing for an interview: prompt injection is not solved, so I design assuming it will succeed occasionally and limit the blast radius accordingly.
 
-### Q216. Evaluating an AI feature
+### Q227. Evaluating an AI feature
 
 Non-determinism means the usual assert-equals test does not apply, so I build a layered evaluation instead of pretending the problem away.
 
@@ -1719,7 +1923,7 @@ Non-determinism means the usual assert-equals test does not apply, so I build a 
 
 Then the discipline: run the suite in CI on every prompt, model or retrieval change (prompts are code and belong in version control), pin model versions and treat a provider's model update as a change requiring re-evaluation, and define release criteria as thresholds rather than vibes. Report a distribution and a confidence interval, not a single score.
 
-### Q217. Streaming responses
+### Q228. Streaming responses
 
 **SSE** is the right default for LLM output: one-directional server-to-client, plain HTTP so it traverses proxies and load balancers, automatic browser reconnection with `Last-Event-ID`, and trivial in Spring (`SseEmitter` in MVC, or `Flux<ServerSentEvent>` in WebFlux). **WebSocket** only when you genuinely need bidirectional low-latency messaging - interrupting generation mid-stream, collaborative sessions, voice. **WebFlux** is an implementation choice underneath either, valuable because a long-held stream ties up a thread in MVC - though with virtual threads that objection largely disappears, so I would not adopt WebFlux for this reason alone in 2026.
 
@@ -1732,7 +1936,7 @@ The operational concerns are where experience shows:
 - **Heartbeats** to keep idle connections alive, graceful shutdown that drains streams, and sticky-free design so any instance can serve.
 - Content moderation and validation become harder because you are emitting before you have the whole answer - buffer a window, or accept the risk and be able to retract.
 
-### Q218. Spring AI versus LangChain4j versus building it
+### Q229. Spring AI versus LangChain4j versus building it
 
 Both give the same core value: a provider-agnostic chat and embedding client, structured output binding to Java types, tool/function calling, chat memory, document loaders and splitters, vector store abstractions over pgvector/OpenSearch/Qdrant, and RAG plumbing. Spring AI fits naturally into Boot's auto-configuration, observability and testing story, which is decisive when the rest of the stack is Spring; LangChain4j is framework-agnostic and has moved faster on some agent features.
 
@@ -1742,7 +1946,7 @@ What I would build myself regardless: prompt management and versioning (they are
 
 The caveat I would state: these libraries move quickly and their abstractions are still settling, so I keep them behind my own domain interface rather than letting their types spread through the codebase - the same discipline I would apply to any fast-moving dependency.
 
-### Q219. PII and compliance with third-party models `[A]`
+### Q230. PII and compliance with third-party models `[A]`
 
 I start from the data, not the model: classify what is being sent, and establish the legal basis and residency requirements before choosing a provider.
 
@@ -1757,7 +1961,7 @@ Controls I would put in place:
 
 The framing I would give leadership: this is a data-governance decision with a technical implementation, so legal, security and engineering agree the boundary once, and I encode it as a policy the platform enforces rather than a rule each team remembers.
 
-### Q220. Pushing back on a poor-fit AI feature `[A]`
+### Q231. Pushing back on a poor-fit AI feature `[A]`
 
 I do not open with "no". I try to understand the outcome they actually want, because the request is usually a proposed *solution* to a real problem, and the problem is often legitimate even when the solution is not.
 
@@ -1771,7 +1975,7 @@ And if the decision goes against me after that, I commit to it and instrument it
 
 ## 14. System design
 
-The system design questions in [questions.md](questions.md) (Q221-Q230) are worked as full scenarios in [scenario-questions.md](scenario-questions.md), with clarifying questions, capacity estimates, component choices and failure analysis for each.
+The system design questions in [questions.md](questions.md) (Q232-Q241) are worked as full scenarios in [scenario-questions.md](scenario-questions.md), with clarifying questions, capacity estimates, component choices and failure analysis for each.
 
 Universal structure to apply to any of them:
 

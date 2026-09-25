@@ -138,7 +138,7 @@ I would find it with `pg_stat_statements` ordered by total time, comparing again
 2. Refund affected customers proactively, before they ask, and notify them. At this level, saying that unprompted matters - the technical fix is table stakes, the customer handling is judgement.
 3. Short-term mitigation: a duplicate-detection guard on (customer, amount, hash) within a few minutes, deployed while the real fix is built.
 
-**Execute (proper fix).** The idempotency key design from [answers.md](answers.md) Q173:
+**Execute (proper fix).** The idempotency key design from [answers.md](answers.md) Q184:
 
 - Client generates an `Idempotency-Key` per logical payment and reuses it on every retry.
 - Server inserts the key with a unique constraint **in the same transaction** as the payment, stores the response, and returns the stored response on a duplicate. A concurrent in-flight duplicate gets a 409 rather than proceeding.
@@ -172,7 +172,7 @@ Otherwise the consumer itself is the bottleneck - a slow downstream call per mes
 
 1. Check per-partition lag. Even lag across partitions with idle consumers means the partition ceiling; uneven lag means skew.
 2. Check the consumer group for rebalances (`GroupCoordinator` logs, rebalance rate metric). If it is a rebalance storm: raise `max.poll.interval.ms`, lower `max.poll.records` so a batch finishes within it, enable cooperative rebalancing, and use static group membership.
-3. If it is the partition ceiling: increase partitions - accepting the ordering consequence from [answers.md](answers.md) Q176 - or, better if ordering matters, parallelize *within* the consumer by dispatching to a bounded worker pool keyed by the message key, so ordering per key is preserved while throughput scales.
+3. If it is the partition ceiling: increase partitions - accepting the ordering consequence from [answers.md](answers.md) Q187 - or, better if ordering matters, parallelize *within* the consumer by dispatching to a bounded worker pool keyed by the message key, so ordering per key is preserved while throughput scales.
 4. If it is skew: change the partitioning key to something higher-cardinality, or shard the hot key with a suffix.
 5. If it is per-message cost: batch the downstream writes, remove synchronous calls from the hot path, increase `fetch.min.bytes` and batch size, and stop committing every message.
 6. Recovery from 4 million backlog: temporarily scale processing capacity, and consider whether stale messages still need processing at all - for some workloads, seeking to a recent offset and reprocessing the backlog separately is the right call, and knowing when that is acceptable is a business question worth asking.
@@ -237,11 +237,77 @@ Otherwise the consumer itself is the bottleneck - a slow downstream call per mes
 
 ---
 
+### S9. Pods killed with exit code 137 while the heap looks healthy
+
+> A Spring Boot service on Kubernetes restarts every few hours. `kubectl describe pod` shows `Last State: Terminated, Reason: OOMKilled, Exit Code: 137`. The JVM heap dashboard is flat at 60 percent right up to the moment of death, and there is no `OutOfMemoryError` anywhere in the logs. The team has raised the memory limit twice and it keeps happening.
+
+**Clarify.** What is the container memory limit, and what are `-Xmx` or `-XX:MaxRAMPercentage` set to? Is the working set growing steadily or spiking? How many threads does the process run, and is that number stable? Does it correlate with traffic, with a specific endpoint, or purely with uptime? Is the JVM version container-aware, and is the limit set at all - because an unset limit means the JVM sizes the heap against the *node*.
+
+**Isolate.** The absence of an `OutOfMemoryError` is the whole diagnosis. An OOM-kill is `SIGKILL` from the kernel against the *container's* total RSS; a Java `OutOfMemoryError` is the JVM refusing an allocation inside the heap. Seeing the first without the second means the memory is not in the heap. So the arithmetic that matters is:
+
+```text
+container RSS = heap + metaspace + code cache + (threads × stack)
+              + direct buffers + GC structures + JIT arenas + native libs
+```
+
+Four candidates, in the order I would rule them out:
+
+1. **Heap sized too close to the limit.** `-Xmx` at 90 percent of the limit leaves nothing for the other six terms, so the container dies before the heap ever fills. This is the most common cause and the easiest to confirm.
+2. **Thread growth.** Each platform thread carries roughly 1MB of stack. A thread leak, or an unbounded pool, turns into hundreds of megabytes of native memory that no heap dashboard shows.
+3. **Direct buffers.** Netty, the reactive HTTP client, or any NIO path. Handles are cheap on the heap so nothing forces the GC that would free the native memory - see Q105.
+4. **Metaspace or code cache** growing from dynamic proxy generation, which is native memory too.
+
+**Decide.** I would fix the sizing first even before knowing the cause, because it is safe, cheap, and it converts an undiagnosable kernel kill into a diagnosable Java `OutOfMemoryError` with a heap dump attached. Raising the limit again without that just buys hours.
+
+**Execute.**
+
+1. Plot `container_memory_working_set_bytes` against `jvm_memory_used_bytes{area="heap"}`. The gap between the two lines *is* the answer, and its growth rate tells you which of the four candidates it is.
+2. Turn on Native Memory Tracking - `-XX:NativeMemoryTracking=summary`, then `jcmd <pid> VM.native_memory summary.diff` over an hour. It attributes native memory by category (Thread, Class, Code, Internal), which names the culprit directly rather than by inference.
+3. Overlay `jvm_threads_live` and the buffer-pool metric `jvm_buffer_memory_used` on the same window.
+4. Fix the sizing regardless: `-XX:MaxRAMPercentage=70` rather than a hardcoded `-Xmx`, `-XX:MaxMetaspaceSize` and `-XX:MaxDirectMemorySize` set explicitly so each has a ceiling and fails loudly, `-XX:+HeapDumpOnOutOfMemoryError` with `HeapDumpPath` on a volume that survives the pod, and `-XX:+ExitOnOutOfMemoryError`.
+5. Fix the actual cause once NMT names it - cap the pool, release the buffers, cache the generated proxy.
+
+**Reflect.** Two systemic outputs. First, "the heap is fine" must stop being accepted as evidence that memory is fine; I would put the working-set-versus-heap gap on the service dashboard permanently, because it is the one panel that distinguishes these two failures at a glance. Second, an alert at 85 percent of the container limit that triggers an automatic heap dump and thread dump, so the next occurrence arrives with its own evidence instead of a 137 and a shrug. I would also add the JVM sizing defaults to the base image rather than leaving each team to rediscover the 70 percent rule.
+
+> *Your hook: the service where the gap between working set and heap turned out to be direct buffers, and what capping them did to the restart rate.*
+
+---
+
+### S10. Requests hang while CPU sits at zero
+
+> An endpoint stops responding. Requests pile up until the load balancer times them out, but CPU on the pod is near zero, there are no errors in the logs, and the health check still passes. It started after a release that added a caching layer.
+
+**Clarify.** Is it every endpoint or one? Does the process recover on its own, or only on restart? Are the health checks liveness or just readiness, and are they hitting a path that touches the same code? What did the release actually change - new locks, a new executor, a new synchronized block? Are connections still being accepted?
+
+**Isolate.** Zero CPU with zero progress means threads are *blocked*, not busy. That is a small and well-defined family: a deadlock, a thread pool starved of threads, an unbounded wait on a lock or a connection, or a `ForkJoinPool.commonPool` exhausted by nested parallel work. A CPU profiler will show nothing useful here, because blocked threads consume no CPU - the flame graph looks healthy while the service is dead. The evidence lives in a thread dump.
+
+**Decide.** Capture dumps *before* restarting. A restart destroys the only evidence, and this class of bug reappears at the worst possible time. Thirty seconds of capture buys the root cause; without it you are waiting for a recurrence.
+
+**Execute (capture).** `jcmd <pid> Thread.print > dump1.txt`, three times, ten seconds apart. If the pod is wedged, an ephemeral debug container sharing the process namespace gets you there. Then restart to restore service.
+
+**Execute (read).** In order:
+
+1. **The JVM's own deadlock report** at the bottom of the dump. The JVM detects monitor and `ReentrantLock` cycles itself and names both threads and both locks. If it is there, the diagnosis is finished in one line.
+2. **`BLOCKED` threads and their monitor addresses.** Many threads blocked on the same `<0x...>` with a single owner is contention or a long critical section; find the owner by searching for `locked <0x...>` and look at *what it is doing* - almost always IO inside a lock.
+3. **The same stacks across all three dumps** means stuck; different stacks means slow but progressing. This distinction is why you take three.
+4. **Pool census.** All 200 `http-nio-*` threads in `WAITING` on `getConnection` is pool exhaustion, not deadlock: the fix is a timeout and a bulkhead, not a lock reordering.
+5. **`ForkJoinPool.commonPool-worker-*`** threads blocked means a parallel stream is doing blocking IO, and it has starved every other parallel stream in the JVM.
+
+Given the release added caching, the shape I would expect is the classic one: a `synchronized` cache-refresh method that calls a downstream service inside the lock. One slow call, and every other thread queues on the monitor. It is not a deadlock at all - it is one lock held across IO, which looks identical from the outside.
+
+If it *is* a true cycle, the fixes are: impose a global lock ordering and document it, replace nested locks with `tryLock(timeout)` so the cycle self-breaks and logs instead of hanging, or restructure so only one lock is ever needed. If it is pool starvation: dedicated pools per dependency, `CallerRunsPolicy` for backpressure, and a timeout on every blocking acquire, because an unbounded wait is how a slow dependency becomes an outage.
+
+**Reflect.** The systemic finding is that the liveness probe passed while the service was completely unable to serve, which means it was checking that the JVM was alive rather than that the application worked - I would make it exercise a real path with a timeout so Kubernetes restarts a wedged pod without a human. Beyond that: no blocking call inside a `synchronized` block as a review rule, every lock acquisition and every pool checkout has a timeout, `ReentrantLock.getQueueLength` and pool queue depth exported as metrics so contention is visible before it is total, and automatic thread-dump capture on a latency spike so the next one is diagnosed from the artifact rather than from a reproduction.
+
+> *Your hook: a hang you diagnosed from a thread dump - name the lock, the owner thread and what it was waiting on.*
+
+---
+
 ## Part B - Architecture and system design
 
 Each design below is compressed to the decisions an interviewer is actually grading. Practise by talking through the clarifying questions and the estimate first - candidates who jump to boxes lose points before they draw anything.
 
-### S9. URL shortener at 100 million redirects per day (Q221)
+### S11. URL shortener at 100 million redirects per day (Q232)
 
 **Clarify.** Read/write ratio? Custom aliases? Expiry? Analytics required, and how real-time? Do URLs need to be unguessable? Global users, or one region?
 
@@ -261,7 +327,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S10. Payment processing with strict consistency (Q222)
+### S12. Payment processing with strict consistency (Q233)
 
 **Clarify.** Are we the processor or integrating with one? Which currencies and regions, and therefore which regulations? What is the expected volume and the acceptable failure rate? What are the auditability and retention requirements? Do we hold balances (which means a ledger) or just move money?
 
@@ -270,7 +336,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 - **Double-entry ledger, append-only.** Every movement is two balanced entries; balances are derived, never updated in place. This is non-negotiable for auditability, and saying it immediately signals domain knowledge. Corrections are compensating entries, never updates or deletes.
 - **Strong consistency inside the boundary.** The ledger lives in a single relational database with ACID transactions - this is where I explicitly refuse eventual consistency. Scale it vertically and by partitioning on account, not by relaxing consistency.
 - **Explicit state machine** for the payment: `INITIATED → AUTHORIZED → CAPTURED → SETTLED`, plus `FAILED` and `REFUNDED`, with transitions enforced in the database (a check constraint or a transitions table) so an invalid transition is impossible rather than merely unlikely.
-- **Idempotency everywhere** - client to us, us to the processor - per Q173.
+- **Idempotency everywhere** - client to us, us to the processor - per Q184.
 - **Outbox** for every event we publish, so notifications and downstream projections can never diverge from the ledger.
 - **Reconciliation** as a first-class component: a scheduled job comparing our ledger against the processor's settlement file, alerting on any divergence. Every real payment system has this, and candidates who omit it have not operated one.
 - **Saga with orchestration** where multiple services are involved, with compensations that are semantic (a refund, not a rollback).
@@ -281,7 +347,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S11. Multi-channel notification service (Q223)
+### S13. Multi-channel notification service (Q234)
 
 **Clarify.** What volume, and what burst shape - is there a "send to 10 million users" broadcast case? Per-user preferences and quiet hours? Delivery guarantees - at-least-once with duplicates acceptable, or strict? Do we need delivery status tracking? Templating and localization? Regulatory constraints (opt-out, GDPR)?
 
@@ -302,7 +368,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S12. Distributed rate limiter across 200 instances (Q224)
+### S14. Distributed rate limiter across 200 instances (Q235)
 
 **Clarify.** What is being limited - per API key, per user, per IP, per endpoint? What limits and windows? Is it a hard limit (billing/quota) or a protective one? What is the acceptable error - can we allow 10 percent over? What happens if the coordination store is unavailable?
 
@@ -322,7 +388,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S13. Tamper-evident audit log over five years (Q225)
+### S15. Tamper-evident audit log over five years (Q236)
 
 **Clarify.** What must be auditable - all data changes, or specific regulated events? Who queries it, how often, and by what dimensions? What is the retention and legal hold requirement? Does tamper-evidence need to be cryptographic and externally verifiable, or is restricted access sufficient? Volume per day?
 
@@ -339,7 +405,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S14. Real-time dashboard over 100k events/second (Q226)
+### S16. Real-time dashboard over 100k events/second (Q237)
 
 **Clarify.** What latency does "real-time" mean - one second, or one minute? How many concurrent dashboard viewers? What aggregations, over what time windows? Is exact accuracy required, or are approximations acceptable? How long must the raw data be retained?
 
@@ -358,7 +424,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S15. Monolith to services without a big bang (Q227)
+### S17. Monolith to services without a big bang (Q238)
 
 **Clarify.** What is actually driving this - deployment velocity, scaling, team autonomy, or reliability? (If nobody can answer, the correct recommendation may be *do not do this*, and saying so is a principal-level answer.) How large is the codebase and the team? What is the release cadence today, and what is the constraint on it? Is the database shared, and how entangled is it?
 
@@ -378,7 +444,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S16. Hybrid keyword and semantic document search (Q228)
+### S18. Hybrid keyword and semantic document search (Q239)
 
 **Clarify.** Corpus size and growth? Document types and structure? Query latency requirement? Are results access-controlled per user, and is the control per document or per section? How fresh must the index be after a document changes? Is this a search box, or the retrieval half of a RAG feature?
 
@@ -386,7 +452,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 - **Hybrid retrieval, not either alone.** BM25 catches exact terms, product codes, names and negation, which dense vectors handle poorly; embeddings catch paraphrase and intent, which BM25 misses. Run both and fuse with reciprocal rank fusion. This is the answer, and knowing *why* each fails alone is the substance.
 - **Rerank** the fused top ~50 with a cross-encoder down to the top 5-10. This is usually the single largest quality gain per unit of effort, at the cost of latency - so it is applied to a small candidate set, never the whole corpus.
-- **Chunking** per Q213: structure-aware, 200-500 tokens with overlap, metadata attached, small-to-big retrieval where the matched chunk brings its parent section along.
+- **Chunking** per Q224: structure-aware, 200-500 tokens with overlap, metadata attached, small-to-big retrieval where the matched chunk brings its parent section along.
 - **Access control at query time**, as a pre-filter on the vector and lexical queries - never post-filtering, which both leaks (via result counts and latency) and breaks top-k. In a multi-tenant system this is a security control, not a feature.
 - **Store**: OpenSearch handles both lexical and vector in one system, which avoids operating two stores and keeps fusion simple; pgvector plus Postgres full-text is a good choice when the corpus is moderate and Postgres is already there. A dedicated vector database earns its place at large scale or with demanding filtering.
 - **Indexing pipeline**: change detection, extraction (PDF, HTML, Office), chunking, embedding, and upsert - idempotent and resumable, with the embedding model version stored per vector so a model change triggers a controlled re-index rather than a silently mixed index.
@@ -395,14 +461,14 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S17. Multi-tenant SaaS with isolation and noisy neighbours (Q229)
+### S19. Multi-tenant SaaS with isolation and noisy neighbours (Q240)
 
 **Clarify.** How many tenants, and what is the size distribution - a long tail of small tenants plus a few enormous ones changes everything. What are the compliance and data residency requirements? Is per-tenant customization required? What is the pricing model, since it determines whether per-tenant cost attribution is needed?
 
 **Key decisions.**
 
 - **Isolation model**, the central choice: shared database with a tenant column (cheapest, densest, highest blast radius from a bug); schema per tenant (better isolation, migration complexity grows with tenant count); database per tenant (strongest isolation and easiest per-tenant restore and residency, most expensive and operationally heaviest). My usual recommendation is a **tiered** model - pooled for the long tail, dedicated for enterprise and regulated tenants - which matches cost to willingness to pay and is what most mature SaaS converges on.
-- **Enforce isolation at the lowest layer possible** per Q144: Postgres row-level security or a global Hibernate filter, so a developer who forgets the predicate still cannot leak. Tenant identity comes from the token, never from a request parameter.
+- **Enforce isolation at the lowest layer possible** per Q155: Postgres row-level security or a global Hibernate filter, so a developer who forgets the predicate still cannot leak. Tenant identity comes from the token, never from a request parameter.
 - **Tenant in everything**: cache keys, queue messages, log lines, metrics labels, trace attributes, S3 prefixes, and file names. Every one of these has been a real leak in some product.
 - **Noisy neighbours**: per-tenant rate limits and quotas; bounded concurrency per tenant so one cannot consume the whole pool; separate queues or priority lanes for large tenants; connection pool partitioning; and query cost limits (statement timeouts) so one tenant's expensive query cannot saturate the database. Detect it with per-tenant metrics - without per-tenant instrumentation, noisy-neighbour incidents are undiagnosable.
 - **Onboarding and offboarding as automated flows**, including provisioning, migration and complete deletion, because manual tenant management does not survive growth and GDPR erasure has a deadline.
@@ -412,7 +478,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 ---
 
-### S18. Feature flag and experimentation platform (Q230)
+### S20. Feature flag and experimentation platform (Q241)
 
 **Clarify.** Is this flags only, or A/B experiments with statistical analysis? How many flags and evaluations per second? Is evaluation server-side, client-side, or both? Do we need targeting rules by user attribute? Who changes flags - engineers only, or product managers? Is buy-versus-build on the table (it usually should be)?
 
@@ -435,7 +501,7 @@ Each design below is compressed to the decisions an interviewer is actually grad
 
 Answer these with STAR-L (Situation, Task, Action, Result, Learning) in two to three minutes. The model responses give the *shape* and the judgement being assessed - fill them with real events from Nittany Technologies, Verizon India and Sonata Software.
 
-### S19. Two senior engineers deadlocked on an architectural decision
+### S21. Two senior engineers deadlocked on an architectural decision
 
 > Two of your strongest engineers have been arguing for three weeks about whether to use Kafka or SQS for a new integration. The team is blocked and morale is dropping.
 
@@ -449,7 +515,7 @@ If they remain genuinely equivalent, that is important information: when two opt
 
 **Learning to state.** Three weeks of block is a process failure I own, not theirs. I would introduce a lightweight rule: a technical debate that is not resolved within a week is escalated for a decision, with the decision recorded. Reversible decisions get decided fast; only genuinely irreversible ones earn extended analysis.
 
-### S20. You inherit a team with no tests and a 6-week release cycle
+### S22. You inherit a team with no tests and a 6-week release cycle
 
 > You join as tech lead. The codebase has 4 percent coverage, releases take a weekend and often roll back, and the team believes this is normal.
 
@@ -463,7 +529,7 @@ I would deliberately *not* set a coverage target early. Coverage as a goal produ
 
 **Learning.** The cultural change matters more than the technical one, and it comes from the team experiencing a safe release, not from being told it is possible. My job is to engineer the first one.
 
-### S21. A junior engineer is repeatedly missing estimates
+### S23. A junior engineer is repeatedly missing estimates
 
 > An engineer two years into their career has missed the last four sprint commitments, each time reporting "almost done" until the final day.
 
@@ -477,7 +543,7 @@ I would also check my own contribution: did I make it safe to report bad news, o
 
 **Learning.** Repeated "almost done" is nearly always a signal about the environment, not the individual. Fixing the individual without fixing the environment produces the same problem in the next person.
 
-### S22. The business wants a date you know is unrealistic
+### S24. The business wants a date you know is unrealistic
 
 > A stakeholder has committed publicly to a launch date. Your assessment is that the scope requires twice the time. They ask you to "find a way".
 
@@ -493,7 +559,7 @@ If the decision is still to proceed as committed, I would commit to it, document
 
 **Learning.** The failure was upstream: engineering was not in the room when the commitment was made. I would work to change that, since fixing the process is the only durable answer.
 
-### S23. You made a costly wrong decision
+### S25. You made a costly wrong decision
 
 > Describe a technical decision you made that turned out badly.
 
@@ -505,7 +571,7 @@ Then: how you discovered it, how quickly you acknowledged it publicly, what it c
 
 Candidates at 19 years should have a real one ready. Not having one signals either a lack of ownership or a lack of candour, and interviewers read it that way.
 
-### S24. Your first 90 days
+### S26. Your first 90 days
 
 > What would you do in your first 90 days here?
 
@@ -519,7 +585,7 @@ Throughout: build credibility by helping people rather than by critiquing decisi
 
 **The line worth saying:** at nineteen years in, I have learned that the thing that looks obviously wrong on day three is usually a rational response to a constraint I have not discovered yet. So I would spend the first month finding the constraints.
 
-### S25. Positioning the .NET to Java transition
+### S27. Positioning the .NET to Java transition
 
 > You spent nine years in .NET before moving to Java. How do you present that?
 

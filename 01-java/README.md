@@ -17,10 +17,27 @@ Built for a candidate with **19 years of experience**:
 | File | Purpose | When to use |
 | --- | --- | --- |
 | [README.md](README.md) | Roadmap, positioning, answer frameworks | Read first, revisit weekly |
-| [questions.md](questions.md) | ~200 categorized questions, easy to principal level | Daily drilling, self-testing |
+| [questions.md](questions.md) | 256 categorized questions, core to principal level | Daily drilling, self-testing |
 | [answers.md](answers.md) | Deep model answers with the tricky parts spelled out | After attempting questions yourself |
 | [scenario-questions.md](scenario-questions.md) | Production incidents, architecture and leadership scenarios | Mock interview practice |
 | [cheatsheet.md](cheatsheet.md) | Fast revision reference | Night before, and 30 min before the call |
+| [quiz.html](quiz.html) | Interactive flashcard version of all 256 questions | Active recall practice |
+
+### quiz.html
+
+Open it directly in a browser - no server, no internet connection needed. Every question is collapsed by
+default so you can answer out loud before expanding it.
+
+- Search across question *and* answer text, filter by category, difficulty or your own progress.
+- Mark each question **Known** or **Review**; progress is saved in the browser and survives a refresh.
+- Press `/` to jump to search, `Esc` to clear it.
+
+It is generated from the markdown, so the markdown stays the single source of truth. After editing
+`questions.md`, `answers.md` or `scenario-questions.md`, regenerate with:
+
+```bash
+python tools/build-quiz.py 01-java
+```
 
 ---
 
